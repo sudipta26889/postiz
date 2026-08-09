@@ -1,0 +1,88 @@
+---
+description: Pending Postiz provider setup — check and resume blocked integrations
+alwaysApply: true
+---
+
+# Pending provider setup (postiz.sudiptadhara.in)
+
+## Pending — check later (LinkedIn Page + GMB verification)
+
+### Google My Business — CONNECTED (GrihaTEK Contact; verification may still be pending for new listing)
+
+- **Postiz:** GrihaTEK Contact connected (may show warning badge if listing unverified)
+- **Alternate listing:** GrihaTEK under `contact@grihatek.com` at A-T6-1602 still **Unverified** — phone OTP needed to use that listing instead
+
+### Google My Business — verification notes (if switching listing)
+
+- **GCP project:** GrihaTEK Web (`grihatek-web`)
+- **Done:** OAuth consent screen; Postiz OAuth client; redirect URIs (`/integrations/social/gmb`, `/integrations/social/youtube`); test user `sudiptai26.889@gmail.com`; APIs enabled (Account Management, Business Information); `.env` `GOOGLE_GMB_CLIENT_ID` / `GOOGLE_GMB_CLIENT_SECRET`; Postiz restarted
+- **Created under `contact@grihatek.com`:** GrihaTEK — A-T6-1602, The Soul, New Town, Kolkata 700135 (Software company, website https://grihatek.com) — **Unverified**
+- **OAuth:** Succeeded with `contact@grihatek.com`, but Postiz still shows "We couldn't find any business locations" until the listing is **verified**
+- **Blocked on:** Google phone verification (OTP) — need business/personal phone number; Udyam PDF path was Mac-only (`/Users/sudipta/Downloads/...`) and not readable from this host
+- **Resume when:** User provides phone for OTP (or copies Udyam PDF into workspace / pastes address+phone from certificate) → Get verified on https://business.google.com/u/1/locations → then Postiz → Add Channel → Google My Business → OAuth as `contact@grihatek.com` → select GrihaTEK
+- **Note:** Personal account `sudiptai26.889@gmail.com` already has verified location **Sudipta Dhara** at Tower 6 The Soul — optional alternate if connecting that listing is acceptable
+
+### LinkedIn Page — BLOCKED
+
+- **App:** GrihaTEK LinkedIn developer app (`77x0t9yz239l6s`, app id `263018454`)
+- **Error:** `unauthorized_scope_error` — scope `w_organization_social` not authorized
+- **Cause:** Community Management API not added/approved yet
+- **Done:** Redirect URI configured; Advertising API access request form submitted (Qualtrics)
+- **Resume when:** Community Management API shows under "Added products" on https://www.linkedin.com/developers/apps/263018454/products
+- **Then:** Postiz → Add Channel → LinkedIn Page → OAuth → select page (Revati Craft, Packr, Prodevs, GrihaTEK)
+
+## In progress — Pinterest (first in queue)
+
+- **Portal:** https://developers.pinterest.com/apps/
+- **Redirect URI:** `https://postiz.sudiptadhara.in/integrations/social/pinterest`
+- **Scopes:** `boards:read`, `boards:write`, `pins:read`, `pins:write`, `user_accounts:read`
+- **`.env`:** `PINTEREST_CLIENT_ID` / `PINTEREST_CLIENT_SECRET` still empty
+- **Blocked on:** Pinterest Business login — automation cannot click **Continue with Google** at https://www.pinterest.com/business/login/
+- **Use:** `contact@grihatek.com` (GrihaTEK business) or existing business Pinterest account
+- **Then:** Developer account setup → create app → redirect URI → copy App ID/secret → `.env` → `docker compose up -d postiz` → Postiz → Add Channel → Pinterest
+
+## In progress — Discord (second in queue)
+
+- **Portal:** https://discord.com/developers/applications
+- **Redirect URI:** `https://postiz.sudiptadhara.in/integrations/social/discord`
+- **Scopes:** `identify`, `guilds`, `bot` (permissions `377957124096`)
+- **`.env`:** `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`, `DISCORD_BOT_TOKEN_ID` still empty
+- **Icon:** 1024×1024 required — prepared `/tmp/postiz-icon-1024.png` (upscaled from Postiz favicon)
+- **Blocked on:** Discord Developer Portal login (email/password or QR)
+- **Then:** New Application **Postiz** → upload icon → OAuth2 redirect → Bot token → `.env` → recreate postiz → Add Channel → Discord (server with Manage Server)
+
+## In progress — Slack (third in queue)
+
+- **App:** Postiz on **GrihaTEK** workspace (`A0BNU3BH9GB`, Modern app)
+- **Client ID:** `11784279058257.11776113587555`
+- **`.env`:** `SLACK_ID` / `SLACK_SECRET` set; container recreated
+- **Redirect URI (add manually):** `https://postiz.sudiptadhara.in/integrations/social/slack`
+- **Bot scopes:** `channels:read`, `chat:write`, `users:read`, `groups:read`, `channels:join`, `chat:write.customize`
+- **Icon:** upload square 512+ PNG on Basic Information (use `/tmp/postiz-icon-512.png`)
+- **Blocked on:** OAuth & Permissions UI at `app.slack.com` fails in automation (“Slack couldn’t load”) — configure in a normal browser:
+  1. https://api.slack.com/apps/A0BNU3BH9GB → **OAuth & Permissions** (or app.slack.com app-settings oauth)
+  2. Add redirect URI + scopes above → Save
+  3. **Install App** → Install to GrihaTEK
+- **Then:** Postiz → Add Channel → Slack → authorize GrihaTEK workspace
+
+## Reddit — SKIPPED (not viable without Reddit approval)
+
+- Reddit closed self-service app creation; prefs/apps no longer creates OAuth apps for new developers.
+- Business/company posting via Postiz likely counts as **commercial** → paid API path, not the free ticket queue.
+- **Practical outcome:** Cannot connect Reddit in Postiz until Reddit manually approves a Data Access Request (uncertain, slow).
+
+## Meta (Facebook + Instagram) — DONE
+
+- **App:** Postiz (`1976507323027365`) — Grihatek business portfolio
+- Facebook Page **Grihatek** connected in Postiz
+- Instagram connected in Postiz (linked to Grihatek FB Page in Meta Business Suite)
+- **Publish:** Keep **Unpublished** (dev mode) for your own accounts
+
+## Completed
+
+- Telegram (`@sudipta_postiz_bot`) — Postiz - GrihaTEK group
+- YouTube — GrihaTEK channel (pre-existing)
+- Facebook Page — Grihatek
+- Instagram — Grihatek (Facebook Business)
+- Threads — sudiptai26889 (personal; Grihatek business Threads profile not created yet)
+- X (Twitter) — @GrihaTEK app (`33290868`), Native App, Read and Write

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "transport": "http",
+      "url": "http://mbp.lan:2345/mcp"
+    }
+  }
+}
