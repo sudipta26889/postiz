@@ -1,6 +1,6 @@
 services:
   postiz:
-    image: ghcr.io/gitroomhq/postiz-app:latest
+    image: postiz-app:soul-20260903
     container_name: postiz
     restart: always
     # Override image CMD: `pnpm dlx prisma@6.5.0` re-downloads prisma every boot and
