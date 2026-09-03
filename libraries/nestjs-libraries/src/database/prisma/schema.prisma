@@ -713,11 +713,39 @@ model mastra_ai_spans {
   endedAtZ     DateTime? @default(now()) @db.Timestamptz(6)
   createdAtZ   DateTime? @default(now()) @db.Timestamptz(6)
   updatedAtZ   DateTime? @default(now()) @db.Timestamptz(6)
+  entityType       String?
+  entityId         String?
+  entityName       String?
+  parentEntityType String?
+  parentEntityId   String?
+  parentEntityName String?
+  rootEntityType   String?
+  rootEntityId     String?
+  rootEntityName   String?
+  userId           String?
+  organizationId   String?
+  resourceId       String?
+  runId            String?
+  sessionId        String?
+  threadId         String?
+  requestId        String?
+  environment      String?
+  serviceName      String?
+  experimentId     String?
+  source           String?
+  tags             Json?
+  requestContext   Json?
 
   @@index([name], map: "public_mastra_ai_spans_name_idx")
   @@index([parentSpanId, startedAt(sort: Desc)], map: "public_mastra_ai_spans_parentspanid_startedat_idx")
   @@index([spanType, startedAt(sort: Desc)], map: "public_mastra_ai_spans_spantype_startedat_idx")
+  @@id([traceId, spanId], map: "public_mastra_ai_spans_traceid_spanid_pk")
   @@index([traceId, startedAt(sort: Desc)], map: "public_mastra_ai_spans_traceid_startedat_idx")
+  @@index([entityType, entityId], map: "mastra_ai_spans_entitytype_entityid_idx")
+  @@index([entityType, entityName], map: "mastra_ai_spans_entitytype_entityname_idx")
+  @@index([organizationId, userId], map: "mastra_ai_spans_orgid_userid_idx")
+  @@index([metadata(ops: JsonbOps)], map: "mastra_ai_spans_metadata_gin_idx", type: Gin)
+  @@index([tags(ops: JsonbOps)], map: "mastra_ai_spans_tags_gin_idx", type: Gin)
   @@ignore
 }
 
@@ -797,6 +825,7 @@ model mastra_scorers {
   createdAtZ           DateTime? @default(now()) @db.Timestamptz(6)
   updatedAtZ           DateTime? @default(now()) @db.Timestamptz(6)
   spanId               String?
+  requestContext       Json?
 
   @@index([traceId, spanId, createdAt(sort: Desc)], map: "public_mastra_scores_trace_id_span_id_created_at_idx")
 }
