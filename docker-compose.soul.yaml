@@ -1,0 +1,57 @@
+# SOUL deployment compose file.
+#
+# Upstream's docker-compose.yaml is left untouched on purpose so it never
+# conflicts on an upstream merge. This file is selected automatically because
+# .env sets COMPOSE_FILE=docker-compose.soul.yaml, so plain `docker compose`
+# commands in this directory use it.
+#
+# Differences from upstream's compose:
+#   - runs our locally built image, not ghcr.io/gitroomhq/postiz-app
+#   - reads secrets from .env instead of an inline environment block
+#   - published on host port 4007, behind the reverse proxy for
+#     postiz.sudiptadhara.in
+#   - bind-mounts ./config so config survives a volume prune
+#   - command override + healthcheck + autoheal (see comments inline)
+services:
+  postiz:
+    image: postiz-app:soul-20260903
+    container_name: postiz
+    restart: always
+    # Override image CMD: 'pnpm dlx prisma@6.5.0' re-downloads prisma every boot
+    # and hangs. Use the prisma already bundled in the image.
+    command: sh -c "nginx && (pm2 delete all || true) && pnpm exec prisma db push --accept-data-loss --schema ./libraries/nestjs-libraries/src/database/prisma/schema.prisma && pnpm run --parallel pm2 && pm2 logs"
+    env_file: .env
+    ports:
+      - "4007:5000"
+    volumes:
+      - ./config:/config
+      - postiz-uploads:/uploads
+    labels:
+      - autoheal=true
+    # Backend can die while PM2 still reports 'online'; probe the real :3000
+    # listener so autoheal restarts the container.
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/',r=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+    networks:
+      - postiz-network
+
+  autoheal:
+    image: willfarrell/autoheal:latest
+    container_name: postiz-autoheal
+    restart: always
+    environment:
+      AUTOHEAL_CONTAINER_LABEL: autoheal
+      AUTOHEAL_INTERVAL: 10
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    network_mode: none
+
+networks:
+  postiz-network:
+
+volumes:
+  postiz-uploads:
