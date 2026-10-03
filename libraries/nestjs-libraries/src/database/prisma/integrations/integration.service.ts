@@ -154,6 +154,10 @@ export class IntegrationService {
     return this._integrationRepository.getIntegrationsList(org);
   }
 
+  getChannelHealth(org: string, includeDeleted = false) {
+    return this._integrationRepository.getChannelHealth(org, includeDeleted);
+  }
+
   getIntegrationForOrder(id: string, order: string, user: string, org: string) {
     return this._integrationRepository.getIntegrationForOrder(
       id,
@@ -519,6 +523,20 @@ export class IntegrationService {
 
   customers(orgId: string) {
     return this._integrationRepository.customers(orgId);
+  }
+
+  async updateCustomerName(orgId: string, id: string, name: string) {
+    const exists = await this._integrationRepository.getCustomerByName(
+      orgId,
+      name
+    );
+    if (exists && exists.id !== id) {
+      throw new HttpException(
+        'A group with this name already exists',
+        HttpStatus.BAD_REQUEST
+      );
+    }
+    return this._integrationRepository.updateCustomerName(orgId, id, name);
   }
 
   getPlugsByIntegrationId(org: string, integrationId: string) {

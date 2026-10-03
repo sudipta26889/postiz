@@ -361,7 +361,8 @@ export class PostActivity {
           true,
           false,
           !/<\/?[a-z][\s\S]*>/i.test(p.content),
-          getIntegration.mentionFormat
+          getIntegration.mentionFormat,
+          !!getIntegration.inlineImages?.(JSON.parse(p.settings || '{}'))
         ),
         settings: JSON.parse(p.settings || '{}'),
         media: await this._postService.updateMedia(
@@ -498,7 +499,10 @@ export class PostActivity {
         return;
       }
 
-      const post = await this._postService.getPostByForWebhookId(postId);
+      const post = await this._postService.getPostByForWebhookId(
+        postId,
+        integrationId
+      );
       await Promise.all(
         webhooks.map(async (webhook) => {
           try {

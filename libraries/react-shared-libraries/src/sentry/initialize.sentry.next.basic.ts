@@ -13,6 +13,11 @@ export const initializeSentryBasic = (environment: string, dsn: string, extensio
     /^NetworkError when attempting to fetch resource\.$/i,
     /^NetworkError when attempting to fetch resource\. .*/i,
     /^Object captured as promise rejection with keys: code, message$/i,
+    /^Called on script loaded before session recording is available$/i,
+    /^Failed to connect to MetaMask$/i,
+    /^MetaMask extension not found$/i,
+    /^undefined is not an object \(evaluating '\w+\.progress'\)$/i,
+    /^Cannot read properties of undefined \(reading 'progress'\)$/i,
   ];
 
   // Browser wallet extensions (Phantom, MetaMask, etc.) reject with a plain
@@ -49,7 +54,7 @@ export const initializeSentryBasic = (environment: string, dsn: string, extensio
       sendDefaultPii: true,
       ...extension,
       debug: environment === 'development',
-      tracesSampleRate: 1.0,
+      tracesSampleRate: 0.1,
 
       beforeSend(event, hint) {
         if (isWalletExtensionRejection(hint?.originalException)) {
