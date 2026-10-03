@@ -24,7 +24,7 @@ if [ "${BEHIND}" -eq 0 ]; then
   echo "Already up to date. Nothing to do."
   exit 0
 fi
-git log --oneline HEAD..upstream/main | head -40
+git log --oneline -40 HEAD..upstream/main  # ponytail: -40 not | head, head + pipefail = SIGPIPE exit
 
 echo
 echo "==> merging"
