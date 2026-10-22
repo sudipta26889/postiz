@@ -17,6 +17,7 @@ const ALLOWED_TAGS = [
 ];
 
 const ALLOWED_ATTR = [
+  'dir',
   'href',
   'target',
   'rel',
@@ -43,7 +44,14 @@ export const sanitizePostContent = (value: unknown): string => {
     return '';
   }
 
-  return DOMPurify.sanitize(value, {
+  // a block tag the editor doesn't know would be dropped with its text kept,
+  // gluing its line to the next one
+  const paragraphs = value.replace(
+    /<(\/?)(div|section|article|blockquote|pre|h[4-6])\b[^<>]*>/gi,
+    '<$1p>'
+  );
+
+  return DOMPurify.sanitize(paragraphs, {
     ALLOWED_TAGS,
     ALLOWED_ATTR,
     ALLOWED_URI_REGEXP: /^(?:https?:|mailto:|\/|#)/i,

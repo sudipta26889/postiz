@@ -24,6 +24,7 @@ interface OpenModalInterface {
   top?: string | number;
   closeOnEscape?: boolean;
   withCloseButton?: boolean;
+  destructive?: boolean;
   askClose?: boolean;
   onClose?: () => void;
   children: ReactNode | ((close: () => void) => ReactNode);
@@ -195,7 +196,7 @@ export const Component: FC<{
                 ? modal.top
                   ? ''
                   : 'min-h-full pt-[100px] pb-[100px] mobile:pt-[24px] mobile:pb-[24px] mobile:px-[8px]'
-                : 'h-screen',
+                : 'h-screen mobile:h-dvh',
               modal.size && modal.height
                 ? 'flex justify-center items-center'
                 : 'top-0 left-0'
@@ -206,6 +207,7 @@ export const Component: FC<{
                 !modal.removeLayout &&
                   'gap-[40px] p-[32px] mobile:gap-[24px] mobile:p-[16px]',
                 'bg-newBgColorInner mx-auto flex flex-col w-fit rounded-[24px] mobile:rounded-[16px] relative mobile:!max-w-full',
+                modal.destructive && 'border-2 border-red-700',
                 modal.size ? '' : 'min-w-[600px] mobile:min-w-0 mobile:w-full',
                 modal.fullScreen && 'h-full'
               )}
@@ -344,14 +346,23 @@ export const DecisionModal: FC<{
   approveLabel: string;
   cancelLabel: string;
   onlyApprove: boolean;
+  destructive?: boolean;
   resolution: (value: boolean) => void;
-}> = ({ description, cancelLabel, approveLabel, resolution, onlyApprove }) => {
+}> = ({
+  description,
+  cancelLabel,
+  approveLabel,
+  resolution,
+  onlyApprove,
+  destructive,
+}) => {
   const { closeCurrent } = useModals();
   return (
     <div className="flex flex-col">
       <div className="max-w-[600px]">{description}</div>
       <div className="flex gap-[12px] mt-[16px]">
         <Button
+          className={destructive ? '!bg-red-800' : undefined}
           onClick={() => {
             resolution(true);
             closeCurrent();
@@ -381,6 +392,7 @@ export const areYouSure = ({
   description = 'Are you sure you want to close this modal?' as any,
   approveLabel = 'Yes',
   cancelLabel = 'No',
+  destructive = false,
 } = {}): Promise<boolean> => {
   return new Promise<boolean>((newRes) => {
     decisionModalEmitter.emit('open', {
@@ -388,6 +400,7 @@ export const areYouSure = ({
       description,
       approveLabel,
       cancelLabel,
+      destructive,
       newRes,
     });
   });
@@ -410,16 +423,19 @@ export const useDecisionModal = () => {
       onlyApprove = false,
       approveLabel = 'Yes',
       cancelLabel = 'No',
+      destructive = false,
       newRes = undefined as any,
     } = {}) => {
       return new Promise<boolean>((res) => {
         modals.openModal({
           title,
           askClose: false,
+          destructive,
           onClose: () => res(false),
           children: (
             <DecisionModal
               onlyApprove={onlyApprove}
+              destructive={destructive}
               resolution={(value) => (newRes ? newRes(value) : res(value))}
               description={description}
               approveLabel={approveLabel}

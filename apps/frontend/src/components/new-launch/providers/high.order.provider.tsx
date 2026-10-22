@@ -22,6 +22,7 @@ import { InternalChannels } from '@gitroom/frontend/components/launches/internal
 import { createPortal } from 'react-dom';
 import clsx from 'clsx';
 import SafeImage from '@gitroom/react/helpers/safe.image';
+import { useMediaSettingsValues } from '@gitroom/frontend/components/new-launch/media.settings.section';
 
 class Empty {
   @IsOptional()
@@ -83,7 +84,7 @@ export const withProvider = function <T extends object>(params: {
       setHide,
     } = useLaunchStore(
       useShallow((state) => ({
-        date: state.date,
+        date: state.channelDates[props.id] || state.date,
         tab: state.tab,
         global: state.global,
         dummy: state.dummy,
@@ -148,6 +149,10 @@ export const withProvider = function <T extends object>(params: {
         );
       }
     }, [justCurrent, current, isGlobal, setTotalChars]);
+
+    const hasMediaSettings = useMediaSettingsValues().some(
+      (p) => p.media?.length
+    );
 
     const getInternalPlugs = useCallback(async () => {
       return (
@@ -218,14 +223,6 @@ export const withProvider = function <T extends object>(params: {
                       selectedIntegration.integration.additionalSettings || '[]'
                     )
                   ),
-            fix: () => {
-              setCurrent(props.id);
-              setHide(true);
-            },
-            preview: () => {
-              setCurrent(props.id);
-              setHide(true);
-            },
           };
         },
         getValues: () => {
@@ -238,6 +235,17 @@ export const withProvider = function <T extends object>(params: {
         },
         trigger: () => {
           return form.trigger();
+        },
+        // a save that failed on this channel brings it into view, with its
+        // settings showing what is wrong
+        fix: () => {
+          setCurrent(props.id);
+          setHide(true);
+          form.trigger();
+        },
+        preview: () => {
+          setCurrent(props.id);
+          setHide(true);
         },
       }),
       [value]
@@ -307,7 +315,7 @@ export const withProvider = function <T extends object>(params: {
               ))}
             {(SettingsComponent || !!data?.internalPlugs?.length) &&
               createPortal(
-                <div data-id={props.id} className={isGlobal ? 'bg-newSettings pb-[12px] px-[12px]' : 'hidden bg-newSettings px-[12px] pb-[12px]'}>
+                <div data-id={props.id} className={isGlobal ? 'bg-newSettings pb-[12px] px-[12px] mobile:bg-transparent mobile:px-[16px]' : 'hidden bg-newSettings px-[12px] pb-[12px] mobile:bg-transparent mobile:px-[16px]'}>
                   {isGlobal && (
                     <style>{`#wrapper-settings {display: flex !important} #social-empty {display: block !important;}`}</style>
                   )}
@@ -342,6 +350,7 @@ export const withProvider = function <T extends object>(params: {
               )}
             {current &&
               !SettingsComponent &&
+              !hasMediaSettings &&
               createPortal(
                 <style>{`#wrapper-settings {display: none !important;} #social-empty {display: block !important;}`}</style>,
                 document.querySelector('#social-settings') ||

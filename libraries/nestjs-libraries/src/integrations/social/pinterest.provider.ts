@@ -61,7 +61,7 @@ export class PinterestProvider
     'pins:write',
     'user_accounts:read',
   ];
-  override maxConcurrentJob = 3; // Pinterest has more lenient rate limits
+  override maxConcurrentJob = 10; // Pinterest limits are per user
   maxLength() {
     return 500;
   }
@@ -119,6 +119,13 @@ export class PinterestProvider
       return {
         type: 'bad-body' as const,
         value: 'You can upload a maximum of 5 images per post on Pinterest.',
+      };
+    }
+    if (body.indexOf('Something went wrong on our end') > -1) {
+      return {
+        type: 'retry' as const,
+        value:
+          'Pinterest reported a temporary error on their side. Please try posting again.',
       };
     }
     if (body.indexOf('Unable to reach the URL') > -1) {

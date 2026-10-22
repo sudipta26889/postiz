@@ -104,6 +104,21 @@ export class IntegrationRepository {
     });
   }
 
+  updateCustomName(org: string, id: string, name: string) {
+    return this._integration.model.integration.update({
+      select: {
+        id: true,
+      },
+      where: {
+        id,
+        organizationId: org,
+      },
+      data: {
+        customName: name.trim() || null,
+      },
+    });
+  }
+
   async setTimes(org: string, id: string, times: IntegrationTimeDto) {
     return this._integration.model.integration.update({
       select: {
@@ -166,6 +181,20 @@ export class IntegrationRepository {
       },
     });
 
+    // The page was picked through a fresh login: the row that keeps living
+    // must also take that login's identity and refresh token, otherwise the
+    // next refresh runs as the old identity and cannot find the page.
+    const fresh = existing
+      ? await this._integration.model.integration.findUnique({
+          where: { id },
+          select: {
+            rootInternalId: true,
+            refreshToken: true,
+            tokenExpiration: true,
+          },
+        })
+      : null;
+
     if (existing) {
       await this._posts.model.post.updateMany({
         where: {
@@ -193,8 +222,16 @@ export class IntegrationRepository {
       },
       data: {
         ...params,
+        ...(fresh?.rootInternalId
+          ? { rootInternalId: fresh.rootInternalId }
+          : {}),
+        ...(fresh?.refreshToken ? { refreshToken: fresh.refreshToken } : {}),
+        ...(fresh?.tokenExpiration
+          ? { tokenExpiration: fresh.tokenExpiration }
+          : {}),
         disabled: false,
         deletedAt: null,
+        refreshNeeded: false,
       },
     });
   }
@@ -349,7 +386,8 @@ export class IntegrationRepository {
         profile: username,
         providerIdentifier: provider,
         token,
-        refreshToken,
+        // never wipe a stored refresh token with an empty one
+        ...(refreshToken ? { refreshToken } : {}),
         ...(expiresIn
           ? { tokenExpiration: new Date(Date.now() + expiresIn * 1000) }
           : {}),
@@ -765,6 +803,9 @@ export class IntegrationRepository {
 
   deleteChannel(org: string, id: string) {
     return this._integration.model.integration.update({
+      select: {
+        id: true,
+      },
       where: {
         id,
         organizationId: org,
@@ -862,6 +903,19 @@ export class IntegrationRepository {
         },
       });
     }
+  }
+
+  enableAllIntegrations(org: string) {
+    return this._integration.model.integration.updateMany({
+      where: {
+        organizationId: org,
+        disabled: true,
+        deletedAt: null,
+      },
+      data: {
+        disabled: false,
+      },
+    });
   }
 
   getPlugsByIntegrationId(org: string, id: string) {
