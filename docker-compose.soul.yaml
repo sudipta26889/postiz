@@ -14,7 +14,7 @@
 #   - command override + healthcheck + autoheal (see comments inline)
 services:
   postiz:
-    image: postiz-app:soul-20261104-2350
+    image: postiz-app:soul-20261108-1621
     container_name: postiz
     restart: always
     # Override image CMD: 'pnpm dlx prisma@6.5.0' re-downloads prisma every boot
