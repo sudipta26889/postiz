@@ -47,8 +47,8 @@ going back past a schema change can drop newer columns.
 ## Stack environment
 
 Every env key must be listed in `soul/stack.yml` as `${KEY:-}` and have its value
-in the Portainer stack Env. A new key goes in `.env`, the stack file and the stack
-Env. To compare the stack file with a `.env`, by key names only:
+in the Portainer stack Env. A new key goes in `.env`, `.env.example`, the stack
+file and the stack Env. To compare the stack file with a `.env`, by key names only:
 
 ```bash
 comm -3 <(grep -oE '^[A-Z_0-9]+=' .env | tr -d = | sort -u) \
@@ -74,8 +74,8 @@ Kept deliberately small, and kept out of files upstream edits often.
 | LinkedIn dual-app | `linkedin.page.provider.ts`, `linkedin.provider.ts`, `facebook.provider.ts` | Post as a personal profile or a company page using separate OAuth apps (`LINKEDIN_PAGE_CLIENT_ID` / `_SECRET`) | Medium. Keep both sides. |
 | This tooling | `soul/` | Nothing upstream will ever create | None |
 
-`.env.example` is deliberately left identical to upstream so it never
-conflicts. Our extra variables are documented here instead:
+`.env` and `.env.example` keep the same key set, so a new key goes in
+`.env.example` too. Our extra variables:
 
 ```
 LINKEDIN_PAGE_CLIENT_ID=       # second LinkedIn OAuth app, for company pages
@@ -117,19 +117,16 @@ against `schema.prisma` and exits non-zero when a column is missing. The sync
 script runs it automatically. If it fails, add the missing columns to the
 model and re-run, then deploy.
 
-## Known issue, not fixed
+## Mastra tables outside the schema
 
-`db push` also drops **21 `mastra_*` tables** that are absent from
-`schema.prisma` entirely (agents, datasets, skills, observational_memory,
-mcp_servers, workspaces, prompt_blocks, experiments and friends). Mastra
-recreates them empty, so any state those features hold is lost on every
-restart. This is upstream behaviour and predates our fork. It is not fatal,
-which is why it is still open.
+`db push` drops any `mastra_*` table that `schema.prisma` does not model, and
+Mastra recreates it empty, losing its state on every restart. On 2026-11-08 the
+live database had 45 Mastra tables and all 45 were modelled, so nothing is
+dropped today. A Mastra upgrade can add tables: `check-mastra-drift.sh` reports
+those as `TABLE ... absent from schema.prisma`.
 
-The clean fix is to give Mastra its own Postgres schema, so Prisma never
-manages its tables at all. `PgStore` accepts a `schemaName`. That is a
-code change in how Postiz constructs its Mastra storage, so it needs its
-own piece of work.
+The clean long-term fix is to give Mastra its own Postgres schema, so Prisma
+never manages its tables. `PgStore` accepts a `schemaName`.
 
 ## Backups
 
