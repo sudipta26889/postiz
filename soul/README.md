@@ -31,9 +31,11 @@ git push origin main        # CI builds, verifies and deploys
 ./soul/build-deploy.sh      # only to re-run CI for what is already on main
 ```
 
-`sync-upstream.sh` runs the drift check against the database in `.env`.
-**Do not run it on a machine whose `.env` holds production values** until dev
-values exist. Run the drift check where production access is intended.
+**Run `soul/check-mastra-drift.sh` before merging any upstream sync or
+`@mastra/pg` bump into `main`**, because every push to `main` deploys and reruns
+`db push` on production. The script only runs read-only queries, so it is the one
+thing allowed against production from a development machine, and only for this
+purpose. `sync-upstream.sh` runs it after its local merge, before anything is pushed.
 
 Undo a sync entirely: `git reset --hard presync-<stamp>` (the tag the sync
 script creates before touching anything).
