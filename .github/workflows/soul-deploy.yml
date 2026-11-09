@@ -66,6 +66,10 @@ jobs:
           LI=$(docker run --rm --entrypoint sh postiz-app:ci -c \
             'grep -rl LINKEDIN_PAGE_CLIENT_ID /app/apps/backend/dist 2>/dev/null | wc -l')
           [ "$LI" -ge 1 ] || { echo "::error::LinkedIn dual-app code missing from compiled backend"; FAIL=1; }
+          # The production Redis ACL only allows postiz:*, so losing this breaks every Redis call.
+          PREFIX=$(docker run --rm --entrypoint sh postiz-app:ci -c \
+            'grep -c "keyPrefix: .postiz:." /app/libraries/nestjs-libraries/src/redis/redis.service.ts') || true
+          [ "$PREFIX" = "1" ] || { echo "::error::Redis keyPrefix missing from image"; FAIL=1; }
           exit "$FAIL"
 
       # Same inputs as above, so this reuses the build instead of repeating it.

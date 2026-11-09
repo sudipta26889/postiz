@@ -42,7 +42,9 @@ script creates before touching anything).
 
 Roll back a deploy: `./soul/rollback.sh <short-sha>`, which sets out the Portainer
 steps and then waits for `/api`. The boot command applies that image's schema, so
-going back past a schema change can drop newer columns.
+going back past a schema change can drop newer columns. Images from before the
+Redis key prefix (including `ab8dfeb` and `6329af9`) write unprefixed keys, so the
+Redis ACL must be widened first or every Redis call fails with NOPERM.
 
 ## Stack environment
 
@@ -72,6 +74,7 @@ Kept deliberately small, and kept out of files upstream edits often.
 | Secrets and config | Portainer stack Env, `.env` (untracked) | Real credentials never enter git or an image (`.dockerignore`) | Low. Keep our lines in `.dockerignore`. |
 | Mastra schema patch | `schema.prisma`, models `mastra_ai_spans` and `mastra_scorers` | See "The Mastra trap" | Medium. Upstream may edit these models. Keep both sides. |
 | LinkedIn dual-app | `linkedin.page.provider.ts`, `linkedin.provider.ts`, `facebook.provider.ts` | Post as a personal profile or a company page using separate OAuth apps (`LINKEDIN_PAGE_CLIENT_ID` / `_SECRET`) | Medium. Keep both sides. |
+| Redis key prefix | `redis.service.ts`, `keyPrefix: 'postiz:'` | Redis db 9 is shared with MeetEcho, and the `postiz_redis_user` ACL only allows `postiz:*` | Low. Keep it on a merge; CI fails without it. |
 | This tooling | `soul/` | Nothing upstream will ever create | None |
 
 `.env` and `.env.example` keep the same key set, so a new key goes in
