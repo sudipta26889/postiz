@@ -1,29 +1,36 @@
 #!/usr/bin/env bash
-# Put a previous image back. Usage: soul/rollback.sh [image-tag]
-# With no argument, falls back to the last known-good upstream image.
+# Put a previous GHCR image back. Usage: soul/rollback.sh <short-sha>
+#
+# The switch itself is done in Portainer, because the operator credentials are
+# not on the development machine. This script says what to do, then waits for
+# production to answer.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-TARGET="${1:-postiz-app:rollback-20260903}"
-
-if ! docker image inspect "${TARGET}" >/dev/null 2>&1; then
-  echo "Image ${TARGET} is not on this host."
-  echo "Available:"
-  docker images postiz-app --format '  {{.Repository}}:{{.Tag}}  {{.CreatedSince}}'
-  echo
-  echo "The 2026-09-03 upstream image can be restored from backup with:"
-  echo "  docker load < /mnt/projects/backups/postiz-20260903/postiz-rollback-image.tgz"
+TARGET="${1:-}"
+if [ -z "${TARGET}" ]; then
+  echo "Usage: soul/rollback.sh <short-sha>"
+  echo "Recent commits on origin/main (each one built has a :<short-sha> image):"
+  git log --format='  %H  %cs  %s' -n 10 origin/main | sed -E 's/^  ([0-9a-f]{7})[0-9a-f]{33}/  \1/'
   exit 1
 fi
 
-echo "==> rolling back to ${TARGET}"
-sed -i "s|image: postiz-app:.*|image: ${TARGET}|" docker-compose.soul.yaml
-docker compose up -d --force-recreate postiz
+cat <<EOF
+==> In the NAS Portainer, open the Postiz stack on endpoint 11 and:
+    1. Set POSTIZ_IMAGE_TAG=${TARGET} in the stack Env.
+    2. Redeploy with "re-pull image" on.
+    3. Afterwards, remove POSTIZ_IMAGE_TAG once main is fixed, or the stack stays pinned.
 
-for i in $(seq 1 30); do
+    WARNING: the boot command runs prisma db push --accept-data-loss with that
+    image's schema, so going back past a schema change can drop newer columns.
+EOF
+read -rp "Press Enter once the redeploy has started... " _
+
+for i in $(seq 1 60); do
   sleep 10
-  STATUS=$(docker inspect postiz --format '{{.State.Health.Status}}' 2>/dev/null || echo missing)
-  echo "  [${i}] ${STATUS}"
-  [ "${STATUS}" = "healthy" ] && break
+  API=$(curl -sk -o /dev/null -w '%{http_code}' https://postiz.sudiptadhara.in/api/ --max-time 15 || echo 000)
+  echo "  [${i}] api=${API}"
+  [ "${API}" = "200" ] && exit 0
 done
-curl -sk -o /dev/null -w 'api=%{http_code}\n' https://postiz.sudiptadhara.in/api/ --max-time 15 || true
+echo "==> /api did not return 200 within 10 minutes. Check the postiz container logs in Portainer."
+exit 1

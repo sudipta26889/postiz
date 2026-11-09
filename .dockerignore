@@ -21,3 +21,10 @@ dist
 .git
 .github
 reports
+
+# Never bake secrets or local notes into an image.
+**/.env
+**/.env.*
+!**/.env.example
+.soul-scratch
+.claude

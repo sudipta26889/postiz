@@ -56,5 +56,5 @@ fi
 
 echo
 echo "==> merged cleanly and no schema drift."
-echo "    Next: ./soul/build-deploy.sh"
+echo "    Next: git push origin main (CI builds and deploys)"
 echo "    Undo everything: git reset --hard presync-${STAMP}"

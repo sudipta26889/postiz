@@ -1,0 +1,127 @@
+name: SOUL Build & Deploy
+
+# main: build the image, verify our customizations, push to GHCR, then fire the
+# Portainer webhook for the stack (soul/stack.yml). Each stage runs only if the
+# previous one passed, so an image missing our patches never reaches production.
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "**/*.md"
+      - ".claude/**"
+  workflow_dispatch:
+
+# One release at a time; a newer push waits for the current one to finish.
+concurrency:
+  group: soul-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/sudipta26889/postiz-app
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        run: |
+          echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "version=$(cat version.txt 2>/dev/null || echo v0.0.0)-soul" >> "$GITHUB_OUTPUT"
+
+      # Build into the local daemon first, so the checks run before anything is pushed.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.dev
+          load: true
+          tags: postiz-app:ci
+          build-args: |
+            NEXT_PUBLIC_VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify our customizations are in the image
+        run: |
+          FAIL=0
+          SPANS=$(docker run --rm --entrypoint sh postiz-app:ci -c \
+            'awk "/^model mastra_ai_spans \{/,/^}/" /app/libraries/nestjs-libraries/src/database/prisma/schema.prisma | grep -cE "requestContext"') || true
+          [ "$SPANS" = "1" ] || { echo "::error::mastra_ai_spans patch missing from image"; FAIL=1; }
+          LI=$(docker run --rm --entrypoint sh postiz-app:ci -c \
+            'grep -rl LINKEDIN_PAGE_CLIENT_ID /app/apps/backend/dist 2>/dev/null | wc -l')
+          [ "$LI" -ge 1 ] || { echo "::error::LinkedIn dual-app code missing from compiled backend"; FAIL=1; }
+          exit "$FAIL"
+
+      # Same inputs as above, so this reuses the build instead of repeating it.
+      - name: Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.dev
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.short }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+          build-args: |
+            NEXT_PUBLIC_VERSION=${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Trigger Portainer stack redeploy
+        id: hook
+        env:
+          # A credential: anyone holding this URL can redeploy the stack.
+          PORTAINER_WEBHOOK_URL: ${{ secrets.PORTAINER_WEBHOOK_URL }}
+        run: |
+          # Until the stack exists this secret is unset, so this job does nothing.
+          if [ -z "$PORTAINER_WEBHOOK_URL" ]; then
+            echo "::warning::PORTAINER_WEBHOOK_URL is not set; image is built but not deployed"
+            exit 0
+          fi
+          # A webhook that lands during a redeploy gets 409, so wait it out.
+          # This repo is public: log the status only, never the response body.
+          for _ in $(seq 1 20); do
+            status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+              --retry 3 --retry-delay 5 --max-time 120 "$PORTAINER_WEBHOOK_URL")
+            echo "Portainer responded HTTP $status"
+            [ "$status" = "409" ] || break
+            sleep 30
+          done
+          [ "${status:0:1}" = "2" ] || exit 1
+          echo "deployed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for production to answer
+        if: steps.hook.outputs.deployed == 'true'
+        run: |
+          # ponytail: /api reports no build SHA, so the old container can pass this.
+          # The sleep covers the usual redeploy start; expose the SHA if that proves too weak.
+          sleep 180
+          for _ in $(seq 1 120); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://postiz.sudiptadhara.in/api/ || true)
+            [ "$code" = "200" ] && exit 0
+            sleep 10
+          done
+          echo "::error::/api did not return 200 within 20 minutes"
+          exit 1
