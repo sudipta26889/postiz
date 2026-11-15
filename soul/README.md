@@ -12,7 +12,12 @@ code read it.
 
 ## Deploying
 
-Push to `main`. `.github/workflows/soul-deploy.yml` builds from `Dockerfile.dev`,
+Push to `main`, then run `./soul/build-deploy.sh` and wait for it to pass. It finds
+the CI run for the pushed commit (waiting up to 90 seconds), dispatches one if the
+push started none, and fails loudly if that can't be done (GitHub Actions turned
+off: the owner enables it at the repo's Settings > Actions).
+
+`.github/workflows/soul-deploy.yml` builds from `Dockerfile.dev`,
 checks the image still has the Mastra patch and LinkedIn dual-app code, pushes
 `:latest` and `:<short-sha>` to GHCR, then fires the Portainer webhook.
 The webhook step does nothing until the `PORTAINER_WEBHOOK_URL` secret is set.
@@ -28,7 +33,7 @@ equivalent, so check the container logs in Portainer after a schema change.
 ```bash
 ./soul/sync-upstream.sh     # tag, fetch, merge, check for the Mastra trap
 git push origin main        # CI builds, verifies and deploys
-./soul/build-deploy.sh      # only to re-run CI for what is already on main
+./soul/build-deploy.sh      # follows the CI run; dispatches one if none started
 ```
 
 **Run `soul/check-mastra-drift.sh` before merging any upstream sync or
