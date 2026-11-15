@@ -87,29 +87,188 @@ instead (owner's yes needed).
 
 Rollback: remove the edge routes and unset `MCP_URL`. No app code, data or schema is touched.
 
-## Not in this design (follow-ups, each needs an owner decision)
+## Owner decisions (2026-11-16)
 
-These gaps from the audit are real, but none is needed for checks 1 to 7. Each one patches upstream-owned code,
-which means a conflict on every sync.
+1. Delete and publish-now tools **stay**, and every MCP call to them goes through **DharaHIL** human approval and
+   fails closed. This is the TaskPilot / ERPNext pattern. → Phase G.
+2. OAuth hardening: **do it properly, in this fork** (Postiz already has an authorization server that only needs
+   fixing, so the fleet rule doesn't make us wait for Studio). → Phases H1 to H3.
+3. Guardian's edge routing: approved. → Phase A.
 
-- **Hardening (audit items):** `scope=` in the 401 challenge; `Cache-Control: no-store` on all `/oauth/token`
-  responses, errors included; `iss` on all three authorize redirects (`oauth.controller.ts:120-122,228-230,
-  247-249`); PKCE for every DCR client (`oauth.service.ts:372-387`); consent page frame-ancestors + CSRF; token
-  expiry, rotating refresh and sha256 storage (today the tokens are deterministic AES and never expire;
-  `pos_` OAuth and `psh_` self-hosted tokens both); RFC 8707 audience binding; scope enforcement; membership
-  re-check. **Proposal: one upstream issue/PR to gitroomhq** ("spec-required hardening for every self-hosted
-  install"). The fork carries nothing. Opening it is outward-facing, so the owner says yes first.
-  Audience binding is not cheap locally: it needs a new nullable column on the grant (an additive schema change,
-  applied by `prisma db push` at boot), a policy for existing grants without one, and a check in every per-path
-  handler, because `pos_` tokens are also accepted on `/api/mcp` (`start.mcp.ts:58,434`).
+Phases ship one PR each, in this order: A → G0+G → H1 → H2 → H3. Each PR comes with its own tests (jest; the repo has no
+tests today, so each phase adds them next to the code). The developer builds, the lead reviews, and the owner merges.
 
-- **Human-gated tools under the fleet rule:** `deletePostTool`, and `schedulePostTool` type `now` (publish
-  immediately) are exposed on every surface. If the owner wants them gated, gate on **how the caller
-  authenticated**, not on the mount path, because a `pos_` OAuth token also works on `/api/mcp`:
-  - put `authMethod: 'oauth'` into the async context (`async.storage.ts`, the same way `relay` is carried and read
-    through `getRelay()`) whenever the token starts with `pos_`, on both `start.mcp.ts:396` and `:446`;
-  - have the two tools refuse delete and `now` for that method (undefined context = in-app agent = allowed);
-  - for relayed `psh_` calls, refuse in the relay wrapper (`mcp.relay.service.ts`), not on the remote instance.
+## Phase G0: a test harness that runs
 
-  Key-based agents keep today's behaviour. Owner decides: gate for OAuth only (recommended), for every surface, or
-  keep as is.
+There are no tests in the repo. `jest.config.ts` and `jest.preset.js` need `@nx/jest`, which isn't installed. `jest`
+29 and `ts-jest` are installed.
+
+- Replace the root `jest.config.ts` with a plain ts-jest config: `testMatch: **/*.spec.ts` under `libraries/` and
+  `apps/backend`, and a `moduleNameMapper` for `@gitroom/*` built from `tsconfig.base.json` paths. Delete
+  `jest.preset.js` if nothing else uses it.
+- Check: `pnpm test` runs one trivial spec and passes. This ships inside the Phase G PR.
+
+## Phase G: DharaHIL approval for delete and publish-now over MCP (revised after review)
+
+Facts the design rests on (verified):
+- The gateway reuses a request for the same `idempotency_key` **only while it is PENDING**
+  (`DharaHIL/gateway/app/services/approvals.py:89-96`). After any terminal state, the same key opens a new request.
+- `ALLOW` and `AUTO_ALLOWED` come back with no `request_id`. `REQUIRE_APPROVAL` comes back with a `status`.
+  Standing grants match on `run_id` (`approvals.py:226-247`).
+- `/executed` is an unconditional write, and the request stays `APPROVED` until it is reported.
+- A post with `type: "schedule"` and a date at or before now is created and its workflow starts at once
+  (`posts.service.ts:1205-1234`), so it's a publish-now in practice.
+
+**What is gated.** Each tool declares `approval?: (args) => string | null` (a reason, or null for no approval).
+One generic wrapper enforces it, so the helper never names a tool.
+- `deletePostTool` (`tools/delete.post.tool.ts:45`) is always gated.
+- `schedulePostTool` (`tools/integration.schedule.post.ts:173`) is gated when **any** `socialPost` item has
+  `type == "now"`, or a date at or before now + 5 minutes. The whole call is gated, after validation (`:181-247`)
+  and before the `createPost` loop (`:249`).
+
+**Where it applies: fail closed.** Every `runWithContext` call in `start.mcp.ts` (`:396`, `:446`, `:486`, `:525`) sets
+`surface: 'mcp'`. The in-app chat (`copilot.controller.ts:85-92`) wraps its run in
+`runWithContext({ surface: 'app' })`. The gate is skipped **only** when `surface === 'app'`, so a new entry point that
+forgets the marker is gated. Relayed `psh_` calls (cloud only, `MCP_SELF_HOSTED_RELAY`, off in our deployment) refuse
+gated actions outright with "not available through the relay".
+
+**The approval loop** (generic helper `libraries/nestjs-libraries/src/chat/human.approval.ts`, mirroring TaskPilot's
+`apps/mcp/src/a2a/dharahil.ts`):
+1. `key = postiz:<orgId>:<toolName>:<sha256(canonicalJSON(args))[:24]>`. Canonical JSON uses sorted keys, like
+   the DharaHIL SDK.
+2. Redis is the existing `ioRedis` client. It adds `postiz:` itself (`redis.service.ts:44`), so keys are written
+   without it. `hil:req:<key>` → `requestId`, TTL until `expires_at`, extended by 7 days once the request is seen
+   APPROVED so a late caller doesn't lose the approval. **If `REDIS_URL` is unset**, the client is `MockRedis`, whose
+   `set` ignores `NX` (`redis.service.ts:11-14,39-46`). Then gated actions are refused (`isError`), because the
+   at-most-once claim can't be guaranteed.
+3. With no mapping, `POST /v1/requests` with `run_id = key` (so standing grants never spread to other calls),
+   `risk_level HIGH`, `metadata {org, tool, post_id?}`, and the redacted args.
+   - `ALLOW` / `AUTO_ALLOWED` (policy said yes): run with the original args.
+   - `REQUIRE_APPROVAL`: store the mapping and return a normal result: "Waiting for human approval in DharaHIL
+     (request <id>, expires <time>). Call this tool again with the same arguments once approved."
+   - `DENY`, or any error: return an `isError` result.
+4. With a mapping, `GET /v1/requests/{id}`.
+   - `PENDING`: return "still waiting".
+   - `APPROVED`: the GET response has no `tool_name` (`DharaHIL/gateway/app/schemas/requests.py:79-103`), so check
+     `metadata.org == orgId` and `metadata.tool == toolName`. Run with `approved_args`. If the human edited them,
+     they go through the tool's **full** checks again: the zod schema, `validatePosts`
+     (`integration.schedule.post.ts:181-247`), the org-scoped integration lookup, and the trigger rule. Only then
+     **claim**:
+     - `SET hil:exec:<requestId> running NX` (TTL 30 days); the first claim runs the action.
+     - After the action, set `done` and report `/executed` (best effort, logged on failure).
+     - A failed claim answers from the stored value: `done` → "already done (request <id>)", `running` →
+       "started earlier and its result is unknown; check before retrying (request <id>)".
+     - The claim comes before execution: at most once, never twice.
+   - `EXECUTED`: "already done".
+   - `REJECTED`, `AUTO_DENIED`, `EXPIRED`, `REVISE_REQUESTED`, `DENY` or any unknown status: delete the mapping and
+     return `isError` with the reason. A later call starts a fresh request.
+   - Any `date` that doesn't parse counts as publish-now (gated).
+   - In-app chat check on dev: `copilot.controller.ts:85-113` sets a Mastra `requestContext`. Confirm that ALS
+     `surface: 'app'` reaches the tools through CopilotRuntime. If it doesn't, in-app delete gets gated, which fails
+     closed but must be fixed before release.
+5. Config: `DHARAHIL_BASE_URL`, `DHARAHIL_TENANT_ID`, `DHARAHIL_APP_ID`, `DHARAHIL_API_KEY`. The gate is **always
+   on**; there is no off switch. With config missing, gated actions return `isError` "approval service not configured".
+   Add the keys to `soul/stack.yml`, `.env.example` and the Portainer Env.
+
+**Not gated:** future scheduling, drafts, edits and reads. This is the owner's scope: delete and publish-now only.
+
+**Rollout dependency:** the DharaHIL `postiz` app must exist before this deploys. Otherwise every MCP delete or
+publish-now is refused, which changes behaviour for the key-based agents that use them today.
+
+**Checks (jest):**
+- Key stability: canonical order gives the same key; different args or a different org give a different key.
+- The decision mapping for every gateway answer.
+- The claim, against a mocked ioredis that honours NX: a second execution is refused; `running` and `done` give
+  different messages; a missing `REDIS_URL` (MockRedis) refuses.
+- Edited `approved_args` that fail validation, or that point at another org's integration, are refused.
+- The trigger: `now`, a past date and a date within 5 minutes are gated; a future date and drafts are not.
+- Fail closed: no config gives an error, and an undefined surface is gated.
+- Dev-instance run-through: delete → waiting → approve → deleted → call again → "already done".
+
+## Phase H1: hardening with no schema change (revised)
+
+| Gap | Change |
+|---|---|
+| `scope=` missing from the 401 | add `scope="mcp:read mcp:write"` to both challenges (`oauth-middleware.ts:91-94,111-122`) |
+| no-store on `/oauth/token` | `Cache-Control: no-store`, `Pragma: no-cache` on every response of the route, errors included (an interceptor or filter scoped to the route) |
+| PKCE | S256 required for **dynamic** apps (DCR, and CIMD later), not only public ones (`oauth.service.ts:372-387`). Static `pca_` apps keep today's lenient flow (`pkceBinding`, `:410-428`), because org integrations depend on it |
+| CORS | `*` without credentials on `/oauth/token` and `/oauth/register` only |
+| Consent CSRF | the backend accepts the cookie alone (`auth.middleware.ts:35`), so `POST /oauth/authorize` (approve and deny) and `/authorize/self-hosted` reject when `Origin` (or `Referer`) isn't the frontend origin |
+| Consent framing | `frame-ancestors 'none'` and `X-Frame-Options: DENY` on the `/oauth/authorize` page; show the redirect host |
+| Membership | a new repository query: the grant's user is still in the org (`UserOrganization`, not disabled), and neither user nor org is deleted. Checked on every OAuth-token MCP call and on public-API `pos_` use (`public.auth.middleware.ts:32-38`) |
+| Origin | on `/mcp-oauth*`: a present `Origin` that isn't allowlisted (`https://claude.ai`, `https://chatgpt.com`, our origin; extend with `MCP_ALLOWED_ORIGINS`) → 403 |
+| Protocol version | on `/mcp-oauth*`: an `MCP-Protocol-Version` outside {2025-03-26, 2025-06-18, 2025-11-25, 2026-07-28} → 400 |
+
+`iss` moves to H2: three issuers share one authorize endpoint, and only H2's `resource` tells us which one the client
+discovered.
+
+## Phase H2: token model for MCP clients (additive schema, revised)
+
+**Scope:** dynamic (DCR/CIMD) apps, which means MCP clients. Static `pca_` apps (org-built integrations on the
+public API) and HubSpot keep today's long-lived tokens unchanged; that's an owner-visible choice, listed below.
+Self-hosted `psh_` grants are out of scope, because the relay is off here.
+
+Schema (all additive, created by `prisma db push`):
+- `OAuthToken`: `id`, `authorizationId` (FK `OAuthAuthorization`), `kind` (`access` | `refresh`),
+  `tokenHash` (unique), `resource`, `scope`, `familyId`, `expiresAt`, `usedAt?`, `revokedAt?`, `createdAt`.
+- `OAuthAuthorization` gains nullable `resource`, `scope`, `codeHash`, `codeConsumedAt`, `lastUsedAt`.
+  Existing rows stay NULL, and NULL scope reads as `mcp:read mcp:write`.
+
+Flow:
+- **Authorize**: `resource` is carried through `ApproveOAuthDto`, the consent frontend and `createAuthorizationCode`.
+  For dynamic apps it must equal a canonical MCP URL (`<origin>/mcp-oauth-dynamic|-claude|-chatgpt`, legacy
+  `/mcp-oauth`), otherwise `invalid_target`. When it's absent, default to the resource of the issuer the request came
+  in on. The code is stored as `codeHash`, with a 5 min TTL (down from 10, `oauth.service.ts:442,483`).
+- **Redirect**: `iss` = the issuer that matches `resource`, on all three redirect paths (`oauth.controller.ts:120-122,
+  228-230,247-249`).
+- **Code exchange**: in one transaction, a conditional update `where codeHash = h and codeConsumedAt IS NULL`.
+  - `count == 0` and the hash matches a consumed row: reuse, so revoke the grant and all its token families.
+  - Otherwise, issue a 1 h access token and a 30 day refresh token (random; only the sha256 hash is stored;
+    lookup by hash).
+- **Refresh**: in one transaction, mark the old token used with a conditional `usedAt IS NULL` update and insert the
+  new pair.
+  - Replay outside a 30 s grace window revokes the family and the grant.
+  - Inside the window, return the pair already issued.
+  - Advertise `refresh_token` on every issuer; DCR accepts and returns it (`oauth.service.ts:207,247`).
+- **Re-consent**: the upsert (`oauth.repository.ts:170-197`) also revokes every earlier family of that grant.
+- **Validation**: for an `/mcp-oauth*` path, hash the token, then look it up in `OAuthToken` (kind access, not
+  expired or revoked), then require `resource == this path's canonical URL`, then run the membership check
+  (from H1), then update `lastUsedAt` (throttled).
+  - New-model tokens are refused on `/api/mcp` and on the public API.
+  - When a hash isn't found, fall back to the legacy column for the transition.
+- **Legacy dynamic tokens** (old column, deterministic AES, no expiry):
+  - They keep working until `OAUTH_LEGACY_DYNAMIC_UNTIL`.
+  - One `refresh_token` grant that presents the legacy token is accepted, which moves the client onto a new family
+    without re-consent.
+  - Before the date is set, the owner gets a read-only count of legacy dynamic grants per client.
+- **Scope**: the plumbing stores and checks scope, but consent grants both scopes (`oauth.service.ts:292-298`).
+  The HTTP 403 `insufficient_scope` needs the JSON-RPC body read before Mastra, which means buffering the stream
+  (MCP handlers run before Nest's body parser, `main.ts:62`). That's a spike in H3, paired with a "read-only" option
+  on the consent page, since enforcing it before then changes nothing.
+
+## Phase H3: client registration, scope, and the admin view
+
+- **CIMD**: an https `client_id` is fetched with the existing `ssrfSafeDispatcher` and `isSafePublicHttpsUrl`
+  (`mcp.relay.service.ts:14-15`), no redirects, a 64 KB cap and a 5 s timeout. `client_id` in the document must equal
+  the URL, and the redirect URI must be listed. It's upserted as a dynamic `OAuthApp` row keyed by the URL, so the
+  existing FKs hold. Advertise `client_id_metadata_document_supported: true`.
+- **DCR**: new registrations are public only (`none`). Existing confidential dynamic apps and private-scheme
+  redirects (e.g. Grok, `oauth.service.ts:189`) keep working.
+- **Revocation**: `/oauth/revoke` (RFC 7009), advertised in the metadata.
+- **Scope**: a "read-only" option on the consent page, plus the stream pre-parse that returns 403
+  `insufficient_scope` for a `tools/call` of a tool without `readOnlyHint` (`tools[name].mcp.annotations`).
+  Spike first: confirm Mastra's `startHTTP` accepts a re-streamed body.
+- **Org admin view**: Settings lists the org's OAuth connections (app, user, created, `lastUsedAt`) with revoke.
+
+## Owner-visible choices made in this revision
+
+- Static OAuth apps and HubSpot keep long-lived tokens. Only MCP clients get the 1 h / rotating model.
+- The gate has no off switch. If DharaHIL is missing or down, MCP delete and publish-now are refused.
+- "Publish now" includes a schedule dated within 5 minutes of now.
+- Gated actions through a self-hosted relay are refused (the relay is not used here).
+
+## Upstream
+
+All of G and H is generic and would help every Postiz install. After it has run in our production for a while,
+offer it to gitroomhq as PRs (the owner says yes first: it's an outward post).
+
