@@ -452,7 +452,15 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
         await deps.redis.srem(pendingSet, requestId);
         continue;
       }
-      const item = JSON.parse(raw);
+      // one unreadable entry must not stop every other approval
+      let item: { action: string; org: string; args: any; key: string };
+      try {
+        item = JSON.parse(raw);
+      } catch {
+        console.error(`[approval] ${requestId} pending entry unreadable, dropped`);
+        await forget(requestId);
+        continue;
+      }
       const executor = executors.get(item.action);
       if (!executor) {
         continue;

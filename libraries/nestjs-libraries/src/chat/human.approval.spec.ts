@@ -246,3 +246,22 @@ describe('sweep: Postiz carries out an approved action itself', () => {
     await expect(gate.sweep()).resolves.toBeUndefined();
   });
 });
+
+describe('sweep robustness', () => {
+  beforeEach(() => {
+    (globalThis as any).__sets = {};
+  });
+
+  it('drops an unreadable pending entry and still runs the others', async () => {
+    const { gate, data } = setup([created, approved, json({})]);
+    const run = jest.fn(async () => 'ok');
+    gate.registerExecutor('public.posts.delete', { execute: run });
+    await gate.decide(input(jest.fn()));
+    // a corrupt entry next to the good one
+    (globalThis as any).__sets['hil:pending'] = JSON.stringify(['bad', 'req1']);
+    data.set('hil:pending:bad', '{not json');
+    await gate.sweep();
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(JSON.parse((globalThis as any).__sets['hil:pending'])).toEqual([]);
+  });
+});
