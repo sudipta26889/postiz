@@ -70,6 +70,8 @@ describe('approval preview: the approver opens the real post', () => {
     const filed = sent.find((s) => s.method === 'POST' && s.url.endsWith('/v1/requests'))!.body;
     expect(filed.tool_args.staged).toEqual(staged);
     expect(filed.tool_args_redacted.preview_1).toBe('https://postiz.test/p/d1?share=true');
+    // DharaHIL renders url fields from tool_args (it recomputes the redacted copy)
+    expect(filed.tool_args.preview_1).toBe('https://postiz.test/p/d1?share=true');
     expect(filed.display_hints.sections[0].fields).toEqual([
       { key: 'preview_1', label: 'ProDevs (x), planned 2027-06-01 10:00 UTC', type: 'url' },
     ]);
@@ -180,5 +182,30 @@ describe('approval preview: the approver opens the real post', () => {
     expect(second.status).toBe('refused');
     expect(second.message).toContain('being filed right now');
     expect(slow).toHaveBeenCalledTimes(1);
+  });
+
+  it('an unedited approval whose args come back with the preview links still runs', async () => {
+    const approved = json({
+      status: 'APPROVED',
+      last_decision_by: { email: 'owner@example.test' },
+      version: 2,
+      metadata: { org: 'org1', tool: 'public.posts.create', staged: 'true' },
+      approved_args: {
+        type: 'schedule',
+        posts: [{ text: 'hi' }],
+        staged,
+        preview_1: 'https://postiz.test/p/d1?share=true',
+      },
+    });
+    const { gate, data } = setup([approved]);
+    const execute = jest.fn(async () => ({ ok: true }));
+    const key = approvalKey('org1', 'public.posts.create', input().args);
+    // only the staging (without links) is left to compare with
+    data.set(`hil:req:${key}`, 'req1');
+    data.set(`hil:stage:${key}`, JSON.stringify({ args: { ...input().args, staged }, links: [] }));
+
+    const result: any = await gate.decide(input(execute));
+    expect(result.status).toBe('executed');
+    expect(execute).toHaveBeenCalledWith(expect.objectContaining({ staged }));
   });
 });
