@@ -13,7 +13,7 @@ export interface AgentToolInterface {
   optionalOnSelfHosted?: boolean;
   // a reason when this call needs a human (DharaHIL) over MCP, null when it
   // does not; enforced for every tool that sets it (human.approval.ts)
-  approval?(args: any): string | null;
+  approval?(args: any, orgId: string): string | null | Promise<string | null>;
   // checks for args a human edited before they run, a reason to refuse or null
   approvalValidate?(args: any, orgId: string): Promise<string | null>;
   run(): ToolReturn;

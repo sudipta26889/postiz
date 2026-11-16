@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import {
   BadRequestException,
   Injectable,
@@ -489,6 +490,37 @@ export class PostsService {
           )
         : []),
     ];
+  }
+
+  // What a human approves in DharaHIL before a scheduled post changes: a
+  // preview to read, the state, and a hash of everything that goes out, so
+  // a change made after the approval is caught before it runs
+  async approvalSnapshot(orgId: string, postId: string) {
+    const ordered = await this.getPostsRecursively(postId, true, orgId, true);
+    const [root] = ordered;
+    if (!root) {
+      throw new NotFoundException('Post not found');
+    }
+
+    return {
+      state: root.state,
+      preview: stripHtmlValidation('none', root.content || '').slice(0, 300),
+      hash: createHash('sha256')
+        .update(
+          JSON.stringify(
+            ordered.map((p) => ({
+              id: p.id,
+              content: p.content,
+              settings: p.settings,
+              image: p.image,
+              publishDate: p.publishDate,
+              integrationId: p.integrationId,
+              state: p.state,
+            }))
+          )
+        )
+        .digest('hex'),
+    };
   }
 
   async getPosts(orgId: string, query: GetPostsDto) {

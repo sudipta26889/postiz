@@ -704,12 +704,46 @@ export class PublicIntegrationsController {
     @Body() body: UpdatePostSettingsDto
   ) {
     Sentry.metrics.count('public_api-request', 1);
-    return this._postsService.updatePostSettings(
-      org.id,
-      id,
-      body.settings,
-      'API'
-    );
+    // a draft's settings are free; a scheduled post's change what goes out,
+    // so a human approves them (DharaHIL)
+    const snapshot = await this._postsService.approvalSnapshot(org.id, id);
+    if (snapshot.state === 'DRAFT') {
+      return this._postsService.updatePostSettings(
+        org.id,
+        id,
+        body.settings,
+        'API'
+      );
+    }
+    return publicApproval.run({
+      action: 'public.posts.settings',
+      org: org.id,
+      args: { id, settings: body.settings, snapshot: snapshot.hash },
+      reason: `Changing the settings of a scheduled post: "${snapshot.preview}"`,
+      execute: async (args) => {
+        await this.assertUnchanged(org.id, args.id, args.snapshot);
+        return this._postsService.updatePostSettings(
+          org.id,
+          args.id,
+          args.settings,
+          'API'
+        );
+      },
+    });
+  }
+
+  // The post must be exactly what the human approved: a change made since
+  // (content, settings, date, channel, state) needs a new approval
+  private async assertUnchanged(orgId: string, id: string, hash: string) {
+    const now = await this._postsService.approvalSnapshot(orgId, id);
+    if (now.hash !== hash) {
+      throw new HttpException(
+        {
+          msg: 'The post changed after it was approved; send the request again to ask for a new approval',
+        },
+        409
+      );
+    }
   }
 
   @Put('/posts/:id/status')
@@ -723,13 +757,21 @@ export class PublicIntegrationsController {
     if (body?.status === 'draft') {
       return this._postsService.changePostStatus(org.id, id, body.status);
     }
+    // the human sees what will go out, and the hash ties the approval to it
+    const snapshot = await this._postsService.approvalSnapshot(org.id, id);
     return publicApproval.run({
       action: 'public.posts.status',
       org: org.id,
-      args: { id, status: body?.status },
-      reason: 'Scheduling a draft to be posted',
-      execute: (args) =>
-        this._postsService.changePostStatus(org.id, args.id, args.status),
+      args: { id, status: body?.status, snapshot: snapshot.hash },
+      reason: `Scheduling a draft to be posted: "${snapshot.preview}"`,
+      execute: async (args) => {
+        await this.assertUnchanged(org.id, args.id, args.snapshot);
+        return this._postsService.changePostStatus(
+          org.id,
+          args.id,
+          args.status
+        );
+      },
     });
   }
 

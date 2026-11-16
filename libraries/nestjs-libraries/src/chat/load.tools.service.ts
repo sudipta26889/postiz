@@ -62,7 +62,7 @@ export class LoadToolsService {
     };
     const gated = mcpApproval.withApproval({
       toolName: p.name,
-      approval: (args) => p.approval!(args),
+      approval: (args, orgId) => p.approval!(args, orgId),
       // args a human edited are refused when the schema can't check them
       validate: async (args, orgId) =>
         (!tool.inputSchema?.['~standard']?.validate

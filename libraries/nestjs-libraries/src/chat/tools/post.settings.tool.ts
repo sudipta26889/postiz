@@ -10,6 +10,15 @@ export class PostSettingsTool implements AgentToolInterface {
   constructor(private _postsService: PostsService) {}
   name = 'postSettingsTool';
 
+  // a draft's settings are free; a scheduled post's change what goes out, so
+  // a human approves them (DharaHIL)
+  approval = async (args: { id: string }, orgId: string) => {
+    const snapshot = await this._postsService.approvalSnapshot(orgId, args.id);
+    return snapshot.state === 'DRAFT'
+      ? null
+      : `Changing the settings of a scheduled post: "${snapshot.preview}"`;
+  };
+
   run() {
     return createTool({
       id: 'postSettingsTool',

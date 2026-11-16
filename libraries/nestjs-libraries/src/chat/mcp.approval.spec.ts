@@ -329,6 +329,72 @@ describe('fail closed', () => {
     expect(app).toBe('ran');
   });
 
+  it('trusts the in-app chat by its request context even when the async context is lost', async () => {
+    const { gate, fetch } = setup([]);
+    const execute = jest.fn(async () => 'ran');
+    const ctx = { requestContext: new Map([['ui', 'true']]) };
+    // no runWithContext at all: the async marker is gone
+    const result = await gate.withApproval({
+      toolName: 'integrationSchedulePostTool',
+      approval: () => 'Publishing or scheduling a post',
+      execute,
+    })(args, ctx);
+    expect(result).toBe('ran');
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('never trusts an MCP call, even one carrying ui = true', async () => {
+    const { gate, fetch } = setup([json({ action: 'DENY', request_id: null })]);
+    const execute = jest.fn();
+    const ctx = {
+      requestContext: new Map([['ui', 'true']]),
+      mcp: { extra: { authInfo: { id: 'org1' } } },
+    };
+    await expect(
+      runWithContext({ requestId: 'r', auth: undefined, surface: 'mcp' }, () =>
+        gate.withApproval({
+          toolName: 'integrationSchedulePostTool',
+          approval: () => 'Publishing or scheduling a post',
+          execute,
+        })(args, ctx)
+      )
+    ).rejects.toThrow();
+    expect(execute).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalled();
+  });
+
+  it('gates a call with no markers at all (fail closed)', async () => {
+    const { gate, fetch } = setup([json({ action: 'DENY', request_id: null })]);
+    const execute = jest.fn();
+    await expect(
+      gate.withApproval({
+        toolName: 'deletePostTool',
+        approval: () => 'Deleting a post',
+        execute,
+      })(args, { mcp: { extra: { authInfo: { id: 'org1' } } } })
+    ).rejects.toThrow();
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('awaits an async approval (a state lookup) and passes the org', async () => {
+    const { gate, fetch } = setup([]);
+    const execute = jest.fn(async () => 'ran');
+    const approval = jest.fn(async (_a: any, org: string) =>
+      org === 'org1' ? null : 'needs a human'
+    );
+    const result = await runWithContext(
+      { requestId: 'r', auth: undefined, surface: 'mcp' },
+      () =>
+        gate.withApproval({ toolName: 'postSettingsTool', approval, execute })(
+          args,
+          { mcp: { extra: { authInfo: { id: 'org1' } } } }
+        )
+    );
+    expect(result).toBe('ran');
+    expect(approval).toHaveBeenCalledWith(args, 'org1');
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
   it('does not ask when the tool says no approval is needed', async () => {
     const { gate, fetch } = setup([]);
     const execute = jest.fn(async () => 'ran');
@@ -339,7 +405,7 @@ describe('fail closed', () => {
           toolName: 'deletePostTool',
           approval: () => null,
           execute,
-        })(args, {})
+        })(args, { mcp: { extra: { authInfo: { id: 'org1' } } } })
     );
     expect(result).toBe('ran');
     expect(fetch).not.toHaveBeenCalled();

@@ -6,19 +6,17 @@ import {
 
 // The public REST API side of the approval gate: a pending approval must
 // never look like success to a REST client, so a decision becomes an HTTP
-// answer (428 pending, 409 already done or unknown, 403 refused).
+// answer (428 pending, 409 already done or unknown, 403 refused, 503 when
+// the approval service itself is unavailable).
 
 export const createPublicApproval = (gate = approvalGate) => ({
   run: async <T>(
     input: Omit<DecideInput<T>, 'isNoop' | 'releaseOnError'>
   ): Promise<T> => {
-    const decision = await gate.decide<T>({
-      ...input,
-      // a 4xx from the action is a validation or lookup failure, before any
-      // side effect: the approved call can be repeated
-      releaseOnError: (err) =>
-        err instanceof HttpException && err.getStatus() < 500,
-    });
+    // No claim is ever released on error here: a failed run may already have
+    // written something (a multi-post create), so its approval is used up and
+    // a repeat answers 409 instead of running again
+    const decision = await gate.decide<T>(input);
 
     switch (decision.status) {
       case 'executed':
@@ -38,7 +36,11 @@ export const createPublicApproval = (gate = approvalGate) => ({
       case 'running':
         throw new HttpException({ msg: decision.message }, 409);
       default:
-        throw new HttpException({ msg: decision.message }, 403);
+        // the service failed (503), or a human or the policy said no (403)
+        throw new HttpException(
+          { msg: decision.message },
+          decision.unavailable ? 503 : 403
+        );
     }
   },
 });

@@ -121,12 +121,12 @@ describe.each([
     expect(rejected.code).toBe(403);
   });
 
-  it('answers 403 with no config or no Redis', async () => {
+  it('answers 503 (service unavailable, not a refusal) with no config or no Redis', async () => {
     const execute = jest.fn();
     const noConfig = setup([], true, false);
-    expect((await status(call(noConfig.approval, action, args, execute))).code).toBe(403);
+    expect((await status(call(noConfig.approval, action, args, execute))).code).toBe(503);
     const noRedis = setup([], false);
-    expect((await status(call(noRedis.approval, action, args, execute))).code).toBe(403);
+    expect((await status(call(noRedis.approval, action, args, execute))).code).toBe(503);
     expect(noConfig.fetch).not.toHaveBeenCalled();
     expect(noRedis.fetch).not.toHaveBeenCalled();
     expect(execute).not.toHaveBeenCalled();
@@ -141,12 +141,11 @@ describe.each([
     expect(execute).toHaveBeenCalledWith(edited);
   });
 
-  it('releases the claim when a 4xx stops the action before it did anything', async () => {
+  it('never re-runs after a failed run: the approval is used up (a multi-post create may have written part)', async () => {
     const { approval } = setup([
       created,
       approved(action, args),
       approved(action, args),
-      json({}),
     ]);
     const execute = jest
       .fn()
@@ -156,6 +155,8 @@ describe.each([
     await expect(call(approval, action, args, execute)).rejects.toThrow(
       'bad request'
     );
-    await expect(call(approval, action, args, execute)).resolves.toBe('ok');
+    expect((await status(call(approval, action, args, execute))).code).toBe(409);
+    expect(execute).toHaveBeenCalledTimes(1);
   });
+
 });

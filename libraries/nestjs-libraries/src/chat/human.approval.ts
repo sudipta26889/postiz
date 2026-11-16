@@ -48,7 +48,9 @@ export type ApprovalDecision<T> =
   // approved earlier: already done, or started and the outcome is unknown
   | { status: 'done' | 'running'; requestId: string; message: string }
   // rejected, expired, denied, not configured, or any error
-  | { status: 'refused'; message: string };
+  // rejected, expired, denied (unavailable: the service itself failed, not a
+  // human: not configured, no Redis, gateway unreachable or erroring)
+  | { status: 'refused'; message: string; unavailable?: boolean };
 
 export interface DecideInput<T> {
   // generic action name, e.g. the tool name or `public.posts.delete`
@@ -367,12 +369,14 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     if (!cfg.baseUrl || !cfg.tenantId || !cfg.appId || !cfg.apiKey) {
       return {
         status: 'refused',
+        unavailable: true,
         message: 'approval service not configured, this action is refused',
       };
     }
     if (!deps.hasRedis()) {
       return {
         status: 'refused',
+        unavailable: true,
         message:
           'Approval needs Redis (REDIS_URL is not set), this action is refused',
       };
@@ -387,7 +391,7 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     } catch (err) {
       // only our own failures are refusals; the action's errors pass through
       if (err instanceof ApprovalError) {
-        return { status: 'refused', message: err.message };
+        return { status: 'refused', unavailable: true, message: err.message };
       }
       throw err;
     }
