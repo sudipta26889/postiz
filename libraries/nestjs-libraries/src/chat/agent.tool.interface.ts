@@ -1,4 +1,7 @@
-import type { ApprovalGuard } from '@gitroom/nestjs-libraries/chat/human.approval';
+import type {
+  ApprovalGuard,
+  ApprovalPreview,
+} from '@gitroom/nestjs-libraries/chat/human.approval';
 import type { ToolAction } from '@mastra/core/tools';
 
 export type ToolReturn = ToolAction<any, any, any, any, any, any>;
@@ -19,5 +22,14 @@ export interface AgentToolInterface {
   approvalValidate?(args: any, orgId: string): Promise<string | null>;
   // duplicate protection for a tool that creates posts (human.approval.ts)
   approvalGuard?: ApprovalGuard;
+  // what the approver previews: may save the post as a draft first and
+  // return the args to file and the links (design: approval-preview)
+  approvalPreview?(
+    args: any,
+    orgId: string,
+    previous: ApprovalPreview | null
+  ): Promise<ApprovalPreview | null>;
+  // runs approved args that carry staged drafts (only the gate sets those)
+  approvalExecute?(args: any, orgId: string): Promise<any>;
   run(): ToolReturn;
 }

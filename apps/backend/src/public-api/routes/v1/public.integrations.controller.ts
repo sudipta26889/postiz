@@ -51,6 +51,7 @@ import { publicApproval } from '@gitroom/nestjs-libraries/chat/public.approval';
 import {
   approvalGate,
   ApprovalGuard,
+  ApprovalPreview,
 } from '@gitroom/nestjs-libraries/chat/human.approval';
 import {
   socialIntegrationList,
@@ -95,7 +96,12 @@ export class PublicIntegrationsController implements OnModuleInit {
     string,
     (org: Organization, args: any) => Promise<any>
   > = {
-    'public.posts.create': (org, args) => this.runCreatePost(org, args),
+    // a staged draft (design: approval-preview) is scheduled as previewed;
+    // a request filed before staging existed creates the post as before
+    'public.posts.create': (org, args) =>
+      Array.isArray(args?.staged)
+        ? this._postsService.approvalScheduleStaged(org.id, args.staged)
+        : this.runCreatePost(org, args),
     'public.posts.delete': async (org, args) => {
       const getPostById = await this._postsService.getPost(org.id, args.id);
       // already gone: nothing to do, said plainly (not an unknown outcome)
@@ -155,11 +161,76 @@ export class PublicIntegrationsController implements OnModuleInit {
   // posts this call edits (an update keeps their ids): they must not count
   // as copies of themselves
   private editedPostIds(args: any): string[] {
-    return (Array.isArray(args?.posts) ? args.posts : [])
-      .flatMap((p: any) => (Array.isArray(p?.value) ? p.value : []))
-      .map((v: any) => v?.id)
-      .filter((id: unknown): id is string => typeof id === 'string' && !!id);
+    return [
+      ...(Array.isArray(args?.posts) ? args.posts : [])
+        .flatMap((p: any) => (Array.isArray(p?.value) ? p.value : []))
+        .map((v: any) => v?.id),
+      // the drafts staged for this approval are the post itself
+      ...(Array.isArray(args?.staged) ? args.staged : []).map(
+        (s: any) => s?.postId
+      ),
+    ].filter((id: unknown): id is string => typeof id === 'string' && !!id);
   }
+
+  // What the approver opens (design: approval-preview). New posts are saved
+  // as drafts first, validated as the real post, and the approval schedules
+  // exactly those drafts. An edit of existing posts is not staged (that
+  // would unschedule them while waiting): it links to them as they are now
+  private createPreview = async (
+    org: Organization,
+    args: any,
+    previous: ApprovalPreview | null
+  ): Promise<ApprovalPreview | null> => {
+    const existing = [];
+    for (const id of this.editedPostIds(args)) {
+      if (await this._postsService.getPost(org.id, id).catch(() => null)) {
+        existing.push(id);
+      }
+    }
+    if (existing.length) {
+      return {
+        args,
+        links: await this._postsService.approvalLinks(org.id, existing, ', as it is now'),
+      };
+    }
+    if (
+      previous &&
+      (await this._postsService.approvalStageValid(org.id, previous.args?.staged))
+    ) {
+      return previous;
+    }
+    const created = await this.runCreatePost(org, args, true);
+    const staged = await this._postsService.approvalStage(
+      org.id,
+      created.map((p: any) => ({
+        postId: p.postId,
+        schedule: true,
+        now: args?.type === 'now',
+      }))
+    );
+    return {
+      args: { ...args, staged },
+      links: await this._postsService.approvalLinks(
+        org.id,
+        staged.map((item) => item.postId)
+      ),
+    };
+  };
+
+  private existingPreview =
+    (org: Organization) =>
+    async (args: any): Promise<ApprovalPreview | null> =>
+      typeof args?.id === 'string' &&
+      (await this._postsService.getPost(org.id, args.id).catch(() => null))
+        ? {
+            args,
+            links: await this._postsService.approvalLinks(
+              org.id,
+              [args.id],
+              ', as it is now'
+            ),
+          }
+        : null;
 
   private approvalGuards: Record<string, ApprovalGuard> = {
     'public.posts.create': {
@@ -298,9 +369,11 @@ export class PublicIntegrationsController implements OnModuleInit {
   @CheckPolicies([AuthorizationActions.Create, Sections.POSTS_PER_MONTH])
   async createPost(
     @GetOrgFromRequest() org: Organization,
-    @Body() rawBody: any
+    @Body() body: any
   ) {
     Sentry.metrics.count('public_api-request', 1);
+    // only the approval gate stages drafts: a caller's `staged` is ignored
+    const { staged: _staged, ...rawBody } = body || {};
     // anything that will be posted needs a human (DharaHIL); drafts don't
     const reason = publishReason([{ type: rawBody?.type }]);
     if (reason === null) {
@@ -323,11 +396,17 @@ export class PublicIntegrationsController implements OnModuleInit {
       reason,
       // an approved edit goes through every check below again
       guard: this.approvalGuards['public.posts.create'],
+      preview: (args, _org, previous) => this.createPreview(org, args, previous),
       execute: (args) => this.approvedActions['public.posts.create'](org, args),
     });
   }
 
-  private async runCreatePost(org: Organization, rawBody: any) {
+  // saveAsDraft: validated as the real post, saved as a draft (approval-preview)
+  private async runCreatePost(
+    org: Organization,
+    rawBody: any,
+    saveAsDraft = false
+  ) {
     const body = await this._postsService.mapTypeToPost(
       {
         ...rawBody,
@@ -405,7 +484,11 @@ export class PublicIntegrationsController implements OnModuleInit {
       ? (rawBody.creationMethod as 'CLI' | 'API')
       : 'API';
 
-    return this._postsService.createPost(org.id, body, creationMethod);
+    return this._postsService.createPost(
+      org.id,
+      saveAsDraft ? { ...body, type: 'draft' } : body,
+      creationMethod
+    );
   }
 
   @Delete('/posts/:id')
@@ -420,6 +503,7 @@ export class PublicIntegrationsController implements OnModuleInit {
       org: org.id,
       args: { id },
       reason: 'Deleting a post cannot be undone',
+      preview: this.existingPreview(org),
       execute: (args) => this.approvedActions['public.posts.delete'](org, args),
     });
   }
@@ -867,6 +951,7 @@ export class PublicIntegrationsController implements OnModuleInit {
       org: org.id,
       args: { id, settings: body.settings, snapshot: snapshot.hash },
       reason: `Changing the settings of a scheduled post: "${snapshot.preview}"`,
+      preview: this.existingPreview(org),
       execute: (args) =>
         this.approvedActions['public.posts.settings'](org, args),
     });
@@ -921,6 +1006,7 @@ export class PublicIntegrationsController implements OnModuleInit {
       args: { id, status: body?.status, snapshot: snapshot.hash },
       reason: `Scheduling a draft to be posted: "${snapshot.preview}"`,
       guard: this.approvalGuards['public.posts.status'],
+      preview: this.existingPreview(org),
       execute: (args) => this.approvedActions['public.posts.status'](org, args),
     });
   }

@@ -1,6 +1,7 @@
 import {
   approvalGate,
   ApprovalGuard,
+  ApprovalPreview,
 } from '@gitroom/nestjs-libraries/chat/human.approval';
 import {
   getAuth,
@@ -18,6 +19,14 @@ export interface WithApprovalOptions {
   validate?: (args: any, orgId: string) => Promise<string | null> | string | null;
   guard?: ApprovalGuard;
   execute: (inputData: any, context: any) => Promise<any>;
+  // what the approver previews (design: approval-preview)
+  preview?: (
+    args: any,
+    orgId: string,
+    previous: ApprovalPreview | null
+  ) => Promise<ApprovalPreview | null>;
+  // runs the approved args (they may carry staged drafts); defaults to execute
+  executeApproved?: (args: any, context: any, orgId: string) => Promise<any>;
 }
 
 // A result every gated tool's outputSchema accepts: { output: { errors } }
@@ -33,7 +42,9 @@ const orgOf = (context: any): string => {
 
 export const createMcpApproval = (gate = approvalGate) => ({
   withApproval:
-    (opts: WithApprovalOptions) => async (inputData: any, context: any) => {
+    (opts: WithApprovalOptions) => async (input: any, context: any) => {
+      // only the gate stages drafts: a caller's `staged` is ignored
+      const { staged: _staged, ...inputData } = input || {};
       // fail closed: only the in-app chat is trusted without a human (a
       // signed-in person is there). It is recognised by either marker, so a
       // lost async context can't break it: the async 'app' surface, or the
@@ -60,7 +71,11 @@ export const createMcpApproval = (gate = approvalGate) => ({
         reason,
         validate: opts.validate,
         guard: opts.guard,
-        execute: (args) => opts.execute(args, context),
+        preview: opts.preview,
+        execute: (args) =>
+          opts.executeApproved
+            ? opts.executeApproved(args, context, org)
+            : opts.execute(args, context),
         // a tool answering with errors did nothing: the claim is released
         isNoop: (result) => !!result?.output?.errors,
       });

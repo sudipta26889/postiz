@@ -417,3 +417,43 @@ describe('fail closed', () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 });
+
+// design: approval-preview. Only the gate sets `staged`: a caller sending it
+// itself must not get a draft scheduled without a person approving
+describe('a caller cannot pass staged drafts', () => {
+  it('a draft-only call (no approval) runs without the caller staged field', async () => {
+    const { gate } = setup([]);
+    const execute = jest.fn(async (a: any) => a);
+    const executeApproved = jest.fn();
+    const result = await runWithContext({ requestId: 'r', auth: undefined, surface: 'mcp' }, () =>
+      gate.withApproval({
+        toolName: 'integrationSchedulePostTool',
+        approval: () => null,
+        execute,
+        executeApproved,
+      })({ socialPost: [{ type: 'draft' }], staged: [{ postId: 'someone-elses', hash: 'x', schedule: true }] }, {
+        mcp: { extra: { authInfo: { id: 'org1' } } },
+      })
+    );
+    expect(result).toEqual({ socialPost: [{ type: 'draft' }] });
+    expect(executeApproved).not.toHaveBeenCalled();
+  });
+
+  it('a gated call files what preview staged, never the caller staged field', async () => {
+    const { gate, calls } = setup([created()]);
+    const preview = jest.fn(async (a: any) => ({ args: { ...a, staged: [{ postId: 'mine', hash: 'h', schedule: true }] }, links: [] }));
+    await runWithContext({ requestId: 'r', auth: undefined, surface: 'mcp' }, () =>
+      gate.withApproval({
+        toolName: 'deletePostTool',
+        approval: () => 'Publishing',
+        execute: jest.fn(),
+        preview,
+      })({ id: 'post1', staged: [{ postId: 'theirs', hash: 'x', schedule: true }] }, {
+        mcp: { extra: { authInfo: { id: 'org1' } } },
+      })
+    );
+    expect((preview.mock.calls[0] as any)[0]).toEqual({ id: 'post1' });
+    const filed = JSON.parse(calls.find((c) => c.init?.method === 'POST' && c.url.endsWith('/v1/requests'))!.init.body);
+    expect(filed.tool_args.staged).toEqual([{ postId: 'mine', hash: 'h', schedule: true }]);
+  });
+});

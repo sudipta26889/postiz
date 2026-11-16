@@ -76,6 +76,20 @@ export interface DecideInput<T> {
   releaseOnError?: (err: unknown) => boolean;
   // duplicate protection for actions that create things (posts)
   guard?: ApprovalGuard;
+  // what the approver previews (design: approval-preview): may stage the
+  // action (e.g. save the post as a draft) and return the args to file and
+  // the links to show. Called once per new request; `previous` is the result
+  // kept from an earlier identical call, to reuse when still valid
+  preview?: (
+    args: any,
+    org: string,
+    previous: ApprovalPreview | null
+  ) => Promise<ApprovalPreview | null>;
+}
+
+export interface ApprovalPreview {
+  args: any;
+  links: { label: string; url: string }[];
 }
 
 // How an action protects against duplicates (design: G4 v3). The decision
@@ -193,6 +207,9 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
   // a pending approval Postiz will carry out itself once a person approves
   const pendingKey = (requestId: string) => `hil:pending:${requestId}`;
   const executors = new Map<string, ApprovalExecutor>();
+  // what preview() staged for a request key (kept, so an identical call
+  // never stages twice and the approved run finds it)
+  const stageKey = (key: string) => `hil:stage:${key}`;
   const joinKey = (org: string, fingerprint: string) =>
     `hil:join:${org}:${crypto.createHash('sha256').update(fingerprint).digest('hex').slice(0, 32)}`;
   const lockKey = (name: string) => `hil:lock:${name}`;
@@ -489,7 +506,11 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       // an error before any side effect releases the claim; any other leaves
       // it as 'running', because the outcome is unknown. Either way it is
       // reported, so nothing fails silently
-      const nothingDone = !!input.releaseOnError?.(err);
+      // an error may also say itself that nothing was done (the sweep has no
+      // caller-specific releaseOnError)
+      const nothingDone =
+        !!input.releaseOnError?.(err) ||
+        err?.getResponse?.()?.nothingDone === true;
       if (nothingDone) {
         await deps.redis.del(execKey(requestId));
       }
@@ -611,7 +632,11 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     // what runs is what the person approved: their edits, or else the args
     // stored when the request was filed, never a later caller's
     const stored = await pendingItem(requestId);
-    const args = data.approved_args ?? stored?.args ?? input.args;
+    const args =
+      data.approved_args ??
+      stored?.args ??
+      (await stagedPreview(key))?.args ??
+      input.args;
     if (input.validate) {
       const problem = await input.validate(args, input.org);
       if (problem) {
@@ -629,6 +654,18 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       input,
       stored?.shown || []
     );
+  };
+
+  const stagedPreview = async (key: string): Promise<ApprovalPreview | null> => {
+    const raw = await deps.redis.get(stageKey(key));
+    if (!raw) {
+      return null;
+    }
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
   };
 
   const ask = async <T>(
@@ -699,6 +736,31 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       }
     }
 
+    // what the approver opens: staged once per request key, kept so an
+    // identical call reuses it and the approved run finds it
+    let filed = input.args;
+    let links: ApprovalPreview['links'] = [];
+    if (input.preview) {
+      const preview = await input.preview(
+        input.args,
+        input.org,
+        await stagedPreview(key)
+      );
+      if (preview) {
+        filed = preview.args;
+        links = preview.links;
+        await deps.redis.set(stageKey(key), JSON.stringify(preview), 'EX', approvedTtl);
+      }
+    }
+    if (links.length) {
+      reason = `${reason}\n\nPreview (exactly what will be posted):\n${links
+        .map((l) => `${l.label}: ${l.url}`)
+        .join('\n')}`;
+    }
+    const linkFields = Object.fromEntries(
+      links.map((l, i) => [`preview_${i + 1}`, l.url])
+    );
+
     const created = await call(cfg, 'POST', '/v1/requests', {
       tenant_id: cfg.tenantId,
       app_id: cfg.appId,
@@ -706,8 +768,24 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       run_id: key,
       step_id: input.action,
       tool_name: input.action,
-      tool_args: input.args,
-      tool_args_redacted: redact(input.args),
+      tool_args: filed,
+      tool_args_redacted: { ...redact(filed), ...linkFields },
+      ...(links.length
+        ? {
+            display_hints: {
+              sections: [
+                {
+                  label: 'Preview (exactly what will be posted)',
+                  fields: links.map((l, i) => ({
+                    key: `preview_${i + 1}`,
+                    label: l.label,
+                    type: 'url',
+                  })),
+                },
+              ],
+            },
+          }
+        : {}),
       context_summary: reason,
       risk_level: 'HIGH',
       environment: 'production',
@@ -747,7 +825,7 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
         JSON.stringify({
           action: input.action,
           org: input.org,
-          args: input.args,
+          args: filed,
           key,
           shown,
           reason,
