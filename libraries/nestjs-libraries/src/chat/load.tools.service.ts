@@ -10,7 +10,10 @@ import { AgentToolInterface } from '@gitroom/nestjs-libraries/chat/agent.tool.in
 import dayjs from 'dayjs';
 import { mcpApproval } from '@gitroom/nestjs-libraries/chat/mcp.approval';
 import { approvalGate } from '@gitroom/nestjs-libraries/chat/human.approval';
-import { runWithContext } from '@gitroom/nestjs-libraries/chat/async.storage';
+import {
+  getContext,
+  runWithContext,
+} from '@gitroom/nestjs-libraries/chat/async.storage';
 import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.service';
 import { RequestContext } from '@mastra/core/di';
 
@@ -39,7 +42,9 @@ export class LoadToolsService {
           .filter((p) => !p.available || p.available())
           .map(async (p) => ({
             name: p.name as string,
-            tool: this.gate(p, await p.run()),
+            // read-only outside the approval gate: a read-only connection's
+            // write is refused before any approval is even asked for
+            tool: this.readOnlyGuard(this.gate(p, await p.run())),
           }))
       )
     ).reduce(
@@ -54,6 +59,34 @@ export class LoadToolsService {
   // A tool that declares `approval` asks a human (DharaHIL) over MCP, whatever
   // it does; the checks the schema makes run before a human is bothered, and
   // again on args a human edited
+  // A read-only OAuth connection (scope without mcp:write) may only call
+  // tools that declare readOnlyHint; any other call is a tool error saying
+  // why (the person reconnects with write access to change that)
+  private readOnlyGuard(tool: any) {
+    if (tool.mcp?.annotations?.readOnlyHint) {
+      return tool;
+    }
+    const execute = tool.execute;
+    tool.execute = async (inputData: any, context: any) => {
+      const ctx = getContext();
+      // fail closed: with no request context at all, only the in-app chat
+      // (its Mastra request context says ui = 'true') may change data
+      if (!ctx && context?.requestContext?.get?.('ui') !== 'true') {
+        throw new Error(
+          `${tool.id || 'This tool'} changes data and the caller could not be identified; refused.`
+        );
+      }
+      const scope = ctx?.scope;
+      if (scope && !scope.split(' ').includes('mcp:write')) {
+        throw new Error(
+          `This connection is read-only (granted: ${scope}); ${tool.id || 'this tool'} changes data. Reconnect with write access to use it.`
+        );
+      }
+      return execute(inputData, context);
+    };
+    return tool;
+  }
+
   private gate(p: AgentToolInterface, tool: any) {
     if (!p.approval) {
       return tool;

@@ -386,6 +386,7 @@ export class OAuthRepository {
     codeChallenge?: string;
     codeChallengeMethod?: string;
     redirectUri?: string;
+    scope?: string | null;
   }) {
     return this._oauthAuth.model.oAuthAuthorization.upsert({
       where: {
@@ -404,6 +405,7 @@ export class OAuthRepository {
         codeChallenge: data.codeChallenge || null,
         codeChallengeMethod: data.codeChallengeMethod || null,
         redirectUri: data.redirectUri || null,
+        scope: data.scope ?? null,
       },
       update: {
         authorizationCode: data.authorizationCode,
@@ -411,6 +413,7 @@ export class OAuthRepository {
         codeChallenge: data.codeChallenge || null,
         codeChallengeMethod: data.codeChallengeMethod || null,
         redirectUri: data.redirectUri || null,
+        scope: data.scope ?? null,
         accessToken: null,
         revokedAt: null,
       },

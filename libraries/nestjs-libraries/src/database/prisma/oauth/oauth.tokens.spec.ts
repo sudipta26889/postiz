@@ -257,7 +257,7 @@ describe('using a rotating access token', () => {
 
   it('works on the MCP resource it is bound to', async () => {
     const repo = repoWith({ findTokenByHash: jest.fn(async () => accessRow()) });
-    expect(await service(repo).getOrgByOAuthToken('pos_x', RESOURCE)).toBe(grant);
+    expect(await service(repo).getOrgByOAuthToken('pos_x', RESOURCE)).toMatchObject({ ...grant, grantedScope: 'mcp:read mcp:write' });
   });
 
   it('is refused elsewhere: another MCP path, /api/mcp or the public API (audience)', async () => {
@@ -268,7 +268,7 @@ describe('using a rotating access token', () => {
 
   it('an unbound token (the client sent no resource) works like before', async () => {
     const repo = repoWith({ findTokenByHash: jest.fn(async () => accessRow({ resource: null })) });
-    expect(await service(repo).getOrgByOAuthToken('pos_x')).toBe(grant);
+    expect(await service(repo).getOrgByOAuthToken('pos_x')).toMatchObject(grant);
   });
 
   it.each([
@@ -284,7 +284,7 @@ describe('using a rotating access token', () => {
   it('falls back to a legacy token when the hash is unknown', async () => {
     const legacy = { ...grant, id: 'auth-legacy' };
     const repo = repoWith({ findByAccessToken: jest.fn(async () => legacy) });
-    expect(await service(repo).getOrgByOAuthToken('pos_old')).toBe(legacy);
+    expect(await service(repo).getOrgByOAuthToken('pos_old')).toMatchObject({ ...legacy, grantedScope: 'mcp:read mcp:write' });
   });
 });
 
@@ -331,5 +331,46 @@ describe('RFC 7009 revocation', () => {
     expect(await errorOf(service(repo).revokeToken('pca_dyn', undefined, 'posr_x'))).toMatchObject({ status: 401 });
     const none = repoWith({ getAppByClientId: jest.fn(async () => null) });
     expect(await errorOf(service(none).revokeToken('nope', undefined, 'x'))).toMatchObject({ status: 401 });
+  });
+});
+
+describe('read-only connections (scope)', () => {
+  it('a read-only consent stores mcp:read on the grant', async () => {
+    const repo = repoWith();
+    await service(repo).createAuthorizationCode('app1', 'u1', 'o1', undefined, true);
+    expect((repo.createAuthorization.mock.calls[0] as any)[0].scope).toBe('mcp:read');
+    await service(repo).createAuthorizationCode('app1', 'u1', 'o1');
+    expect((repo.createAuthorization.mock.calls[1] as any)[0].scope).toBeNull();
+  });
+
+  it('tokens of a read-only grant carry only mcp:read', async () => {
+    const repo = repoWith({
+      findByCode: jest.fn(async () => ({
+        ...grant,
+        scope: 'mcp:read',
+        codeExpiresAt: new Date(Date.now() + 60_000),
+      })),
+    });
+    const res: any = await service(repo).exchangeCodeForToken('code', 'pca_dyn');
+    expect(res.scope).toBe('mcp:read');
+    expect((repo.issueTokens.mock.calls[0] as any)[0].scope).toBe('mcp:read');
+  });
+
+  it('a grant made before (scope NULL) keeps read and write', async () => {
+    const repo = repoWith();
+    const res: any = await service(repo).exchangeCodeForToken('code', 'pca_dyn');
+    expect(res.scope).toBe('mcp:read mcp:write');
+  });
+
+  it('resolving a token says what it may do', async () => {
+    const rotating = repoWith({
+      findTokenByHash: jest.fn(async () => ({
+        id: 't', kind: 'access', familyId: 'f', scope: 'mcp:read', resource: null,
+        expiresAt: new Date(Date.now() + 60_000), usedAt: null, revokedAt: null, authorization: grant,
+      })),
+    });
+    expect((await service(rotating).getOrgByOAuthToken('pos_x'))?.grantedScope).toBe('mcp:read');
+    const legacy = repoWith({ findByAccessToken: jest.fn(async () => ({ ...grant, scope: null })) });
+    expect((await service(legacy).getOrgByOAuthToken('pos_old'))?.grantedScope).toBe('mcp:read mcp:write');
   });
 });

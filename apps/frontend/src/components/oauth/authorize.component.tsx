@@ -1,6 +1,7 @@
 'use client';
 
 import { FC, useCallback, useEffect, useState } from 'react';
+import { Checkbox } from '@gitroom/react/form/checkbox';
 import { useSearchParams } from 'next/navigation';
 import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
 import { Logo } from '@gitroom/frontend/components/new-layout/logo';
@@ -14,6 +15,8 @@ export const OAuthAuthorize: FC<{ logged: boolean }> = ({ logged }) => {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [selfHosted, setSelfHosted] = useState(false);
+  // a read-only connection can list and read, never post, delete or change
+  const [readOnly, setReadOnly] = useState(false);
 
   const clientId = searchParams.get('client_id');
   const responseType = searchParams.get('response_type');
@@ -91,6 +94,7 @@ export const OAuthAuthorize: FC<{ logged: boolean }> = ({ logged }) => {
               client_id: clientId,
               state,
               action,
+              ...(readOnly ? { access: 'read' } : {}),
               ...(redirectUri ? { redirect_uri: redirectUri } : {}),
               ...(codeChallenge ? { code_challenge: codeChallenge } : {}),
               ...(codeChallengeMethod
@@ -116,7 +120,7 @@ export const OAuthAuthorize: FC<{ logged: boolean }> = ({ logged }) => {
         setSubmitting(false);
       }
     },
-    [clientId, state, redirectUri, codeChallenge, codeChallengeMethod]
+    [clientId, state, redirectUri, codeChallenge, codeChallengeMethod, readOnly]
   );
 
   // Sign in (or sign up) and land back on this same request
@@ -255,9 +259,19 @@ export const OAuthAuthorize: FC<{ logged: boolean }> = ({ logged }) => {
                 </div>
                 <ul className="text-[14px] list-disc list-inside space-y-[4px]">
                   <li>Access your integrations and channels</li>
-                  <li>Create and schedule posts on your behalf</li>
+                  {!readOnly && (
+                    <li>Create and schedule posts on your behalf</li>
+                  )}
                   <li>Read your post analytics</li>
                 </ul>
+                <div className="mt-[12px] text-[14px]">
+                  <Checkbox
+                    disableForm={true}
+                    checked={readOnly}
+                    onChange={(e) => setReadOnly(!!e.target.value)}
+                    label="Read-only: it can read, but never post, schedule, delete or change anything"
+                  />
+                </div>
               </div>
 
               {logged ? (

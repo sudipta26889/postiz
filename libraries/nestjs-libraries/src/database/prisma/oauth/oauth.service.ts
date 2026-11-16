@@ -467,11 +467,12 @@ export class OAuthService {
     );
   }
 
-  private grantedScope(app: EmailClaimsApp) {
+  // what a grant allows: the person's choice on the consent page (mcp:read
+  // for read-only), or read and write for every grant made before that
+  private grantedScope(app: EmailClaimsApp, grantScope?: string | null) {
     return [
       ...(this.allowsEmailClaims(app) ? ['openid', 'email'] : []),
-      'mcp:read',
-      'mcp:write',
+      ...(grantScope ? grantScope.split(' ') : ['mcp:read', 'mcp:write']),
     ].join(' ');
   }
 
@@ -612,7 +613,9 @@ export class OAuthService {
       codeChallenge?: string;
       codeChallengeMethod?: string;
       redirectUri?: string;
-    }
+    },
+    // read-only connection chosen on the consent page
+    readOnly = false
   ) {
     const code = makeSecureId(32);
     const encryptedCode = AuthService.fixedEncryption(code);
@@ -627,6 +630,7 @@ export class OAuthService {
       codeChallenge: pkce?.codeChallenge,
       codeChallengeMethod: pkce?.codeChallengeMethod,
       redirectUri: pkce?.redirectUri,
+      scope: readOnly ? 'mcp:read' : null,
     });
     // re-consent re-opens the grant: every token issued before it ends
     await this._oauthRepository.revokeTokensOfAuthorization(authorization.id);
@@ -727,7 +731,7 @@ export class OAuthService {
       }
       const { tokens, response } = this.issueTokenFamily(
         auth.id,
-        this.grantedScope(app),
+        this.grantedScope(app, auth.scope),
         boundTo
       );
       await this._oauthRepository.issueTokens(tokens);
@@ -757,7 +761,7 @@ export class OAuthService {
       cus: paymentId,
       access_token: token,
       token_type: 'bearer',
-      scope: this.grantedScope(app),
+      scope: this.grantedScope(app, auth.scope),
       ...this.refreshFields(app, token),
     };
   }
@@ -959,7 +963,7 @@ export class OAuthService {
     }
     const { tokens, response } = this.issueTokenFamily(
       legacy.id,
-      this.grantedScope(app),
+      this.grantedScope(app, legacy.scope),
       resource ? this.checkResource(resource) : null
     );
     await this._oauthRepository.issueTokens(tokens);
@@ -1128,7 +1132,10 @@ export class OAuthService {
     return {
       access_token: refreshToken,
       token_type: 'bearer',
-      scope: this.grantedScope(app),
+      scope: this.grantedScope(
+        app,
+        'scope' in authorization ? authorization.scope : null
+      ),
       ...this.refreshFields(app, refreshToken),
     };
   }
@@ -1225,7 +1232,8 @@ export class OAuthService {
       ) {
         return null;
       }
-      return grant;
+      // what this token may do (read-only connections: mcp:read)
+      return { ...grant, grantedScope: rotating.scope };
     }
 
     const encrypted = AuthService.fixedEncryption(token);
@@ -1243,7 +1251,10 @@ export class OAuthService {
     ) {
       return null;
     }
-    return authorization;
+    return {
+      ...authorization,
+      grantedScope: authorization.scope || 'mcp:read mcp:write',
+    };
   }
 
   async getUserInfo(authorization?: string) {
