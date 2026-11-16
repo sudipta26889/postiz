@@ -50,7 +50,13 @@ export type ApprovalDecision<T> =
   // rejected, expired, denied, not configured, or any error
   // rejected, expired, denied (unavailable: the service itself failed, not a
   // human: not configured, no Redis, gateway unreachable or erroring)
-  | { status: 'refused'; message: string; unavailable?: boolean };
+  | {
+      status: 'refused';
+      message: string;
+      unavailable?: boolean;
+      // a duplicate of something that exists (REST answers 409)
+      duplicate?: boolean;
+    };
 
 export interface DecideInput<T> {
   // generic action name, e.g. the tool name or `public.posts.delete`
@@ -68,11 +74,25 @@ export interface DecideInput<T> {
   isNoop?: (result: T) => boolean;
   // same, for an error thrown before any side effect
   releaseOnError?: (err: unknown) => boolean;
-  // what the action is about, independent of how it is worded (a post id,
-  // the channels and minute a post goes out): a reworded retry joins the
-  // pending request instead of filing another, and an action already carried
-  // out is not done again for a day
-  target?: string;
+  // duplicate protection for actions that create things (posts)
+  guard?: ApprovalGuard;
+}
+
+// How an action protects against duplicates (design: G4 v3). The decision
+// itself lives with the domain (PostsService); this hook only calls it
+export interface ApprovalGuard {
+  // one id for "this same action", to join an identical waiting request
+  fingerprint: (args: any, org: string) => Promise<string | null> | string | null;
+  // locks held while it runs, so two runs can't both pass the check
+  locks: (args: any, org: string) => Promise<string[]> | string[];
+  // request: inform (refuse an exact copy, warn on a resemblance)
+  // execute: decide (an exact copy, or one the approver wasn't shown, is refused)
+  check: (
+    args: any,
+    org: string,
+    phase: 'request' | 'execute',
+    shown: string[]
+  ) => Promise<{ refuse?: string; warn?: string; shown?: string[] }>;
 }
 
 // How Postiz carries out an approved action on its own (no agent retry):
@@ -81,27 +101,8 @@ export interface ApprovalExecutor {
   execute: (orgId: string, args: any) => Promise<any>;
   validate?: (args: any, orgId: string) => Promise<string | null> | string | null;
   isNoop?: (result: any) => boolean;
+  guard?: ApprovalGuard;
 }
-
-// The minute a post goes out, whatever format the date came in
-const minuteOf = (date: unknown) => {
-  const time = Date.parse(date as string);
-  return Number.isNaN(time)
-    ? String(date ?? '')
-    : new Date(time).toISOString().slice(0, 16);
-};
-
-// What a post request is about, however it is worded: each channel, the
-// minute it goes out and how (now / schedule). Shared by the MCP schedule
-// tool and POST /public/v1/posts
-export const postTarget = (
-  items: { integrationId?: string; date?: unknown; type?: string }[]
-) =>
-  'posts:' +
-  items
-    .map((p) => `${p.integrationId ?? '?'}@${minuteOf(p.date)}:${p.type ?? '?'}`)
-    .sort()
-    .join(',');
 
 // Canonical JSON: sorted keys, like the DharaHIL SDK
 export const canonicalJson = (value: any): string => {
@@ -190,17 +191,28 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
   const pendingKey = (requestId: string) => `hil:pending:${requestId}`;
   const pendingSet = 'hil:pending';
   const executors = new Map<string, ApprovalExecutor>();
-  const doneTargetTtl = DAY;
-  const targetId = (input: { org: string; action: string; target?: string }) =>
-    input.target
-      ? crypto
-          .createHash('sha256')
-          .update(`${input.org}|${input.action}|${input.target}`)
-          .digest('hex')
-          .slice(0, 24)
-      : null;
-  const pendingTargetKey = (t: string) => `hil:target:pending:${t}`;
-  const doneTargetKey = (t: string) => `hil:target:done:${t}`;
+  const joinKey = (org: string, fingerprint: string) =>
+    `hil:join:${org}:${crypto.createHash('sha256').update(fingerprint).digest('hex').slice(0, 32)}`;
+  const lockKey = (name: string) => `hil:lock:${name}`;
+  const lockMs = 5 * 60 * 1000;
+  // delete a lock only if it is still ours (it may have expired and been
+  // taken by another run)
+  const releaseScript =
+    "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+
+  // The stored pending entry: the args the person saw and what they were
+  // shown as resemblances
+  const pendingItem = async (requestId: string) => {
+    const raw = await deps.redis.get(pendingKey(requestId));
+    if (!raw) {
+      return null;
+    }
+    try {
+      return JSON.parse(raw) as { args: any; shown?: string[] };
+    } catch {
+      return null;
+    }
+  };
   const execKey = (requestId: string) => `hil:exec:${requestId}`;
 
   const ttlUntil = (expiresAt: string) =>
@@ -223,20 +235,76 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     requestId: string,
     version: number,
     args: any,
-    input: DecideInput<T>
+    input: DecideInput<T>,
+    shown: string[] = []
   ): Promise<ApprovalDecision<T>> => {
-    // a different request for the same target already ran: a duplicate
-    const target = targetId(input);
-    if (target) {
-      const doneBy = await deps.redis.get(doneTargetKey(target));
-      if (doneBy && doneBy !== requestId) {
-        return {
-          status: 'refused',
-          message: `Not carried out: this duplicates request ${doneBy}, which was already done.`,
-        };
-      }
+    if (!input.guard) {
+      return claimAndRunUnguarded(cfg, requestId, version, args, input);
     }
 
+    // all locks or none, in a fixed order; a busy lock means "try again on
+    // the next sweep", never run, never refuse
+    const token = crypto.randomBytes(16).toString('hex');
+    const names = [...new Set(await input.guard.locks(args, input.org))].sort();
+    const taken: string[] = [];
+    const release = async () => {
+      for (const name of taken) {
+        await deps.redis.eval(releaseScript, 1, lockKey(name), token);
+      }
+    };
+    for (const name of names) {
+      if (!(await deps.redis.set(lockKey(name), token, 'PX', lockMs, 'NX'))) {
+        await release();
+        return pending(
+          requestId,
+          `Approved; another run on the same post is in progress, Postiz will carry this out shortly (request ${requestId}).`
+        );
+      }
+      taken.push(name);
+    }
+
+    try {
+      const verdict = await input.guard.check(args, input.org, 'execute', shown);
+      if (verdict.refuse) {
+        await reportNotExecuted(cfg, requestId, version, verdict.refuse);
+        await forgetPending(requestId);
+        return { status: 'refused', duplicate: true, message: verdict.refuse };
+      }
+      return await claimAndRunUnguarded(cfg, requestId, version, args, input);
+    } finally {
+      await release();
+    }
+  };
+
+  const reportNotExecuted = async (
+    cfg: ApprovalConfig,
+    requestId: string,
+    version: number,
+    reason: string
+  ) => {
+    try {
+      await call(cfg, 'POST', `/v1/requests/${requestId}/executed`, {
+        version,
+        executed: false,
+        result_summary: reason.slice(0, 500),
+      });
+    } catch (err: any) {
+      console.error(`[approval] could not report ${requestId} not executed`, err.message);
+    }
+  };
+
+  const forgetPending = async (requestId: string) => {
+    await deps.redis.srem(pendingSet, requestId);
+    await deps.redis.del(pendingKey(requestId));
+  };
+
+  const claimAndRunUnguarded = async <T>(
+    cfg: ApprovalConfig,
+    requestId: string,
+    version: number,
+    args: any,
+    input: DecideInput<T>
+  ): Promise<ApprovalDecision<T>> => {
     const claimed = await deps.redis.set(
       execKey(requestId),
       'running',
@@ -277,10 +345,6 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     }
 
     await deps.redis.set(execKey(requestId), 'done', 'EX', claimTtl);
-    if (target) {
-      await deps.redis.set(doneTargetKey(target), requestId, 'EX', doneTargetTtl);
-      await deps.redis.del(pendingTargetKey(target));
-    }
     try {
       await call(cfg, 'POST', `/v1/requests/${requestId}/executed`, {
         version,
@@ -325,13 +389,6 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
 
     if (data.status !== 'APPROVED') {
       await deps.redis.del(reqKey(key));
-      const target = targetId(input);
-      if (
-        target &&
-        (await deps.redis.get(pendingTargetKey(target))) === requestId
-      ) {
-        await deps.redis.del(pendingTargetKey(target));
-      }
       return {
         status: 'refused',
         message: `Not approved (${data.status}${
@@ -358,7 +415,10 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
 
     await deps.redis.expire(reqKey(key), approvedTtl);
 
-    const args = data.approved_args ?? input.args;
+    // what runs is what the person approved: their edits, or else the args
+    // stored when the request was filed, never a later caller's
+    const stored = await pendingItem(requestId);
+    const args = data.approved_args ?? stored?.args ?? input.args;
     if (input.validate) {
       const problem = await input.validate(args, input.org);
       if (problem) {
@@ -369,7 +429,14 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       }
     }
 
-    return claimAndRun(cfg, requestId, data.version ?? 1, args, input);
+    return claimAndRun(
+      cfg,
+      requestId,
+      data.version ?? 1,
+      args,
+      input,
+      stored?.shown || []
+    );
   };
 
   const ask = async <T>(
@@ -382,25 +449,39 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       return read(cfg, key, mapped, input);
     }
 
-    const target = targetId(input);
-    if (target) {
-      // already carried out: don't ask a person again
-      const doneBy = await deps.redis.get(doneTargetKey(target));
-      if (doneBy) {
-        return {
-          status: 'done',
-          requestId: doneBy,
-          message: `This was already done (request ${doneBy}); not asking again.`,
-        };
+    let reason = input.reason;
+    let shown: string[] = [];
+    let fingerprint: string | null = null;
+    if (input.guard) {
+      // an identical request still waiting (worded differently): join it
+      fingerprint = await input.guard.fingerprint(input.args, input.org);
+      if (fingerprint) {
+        const waiting = await deps.redis.get(joinKey(input.org, fingerprint));
+        if (waiting && (await pendingItem(waiting))) {
+          const state = await call(cfg, 'GET', `/v1/requests/${waiting}`);
+          if (state.status === 'PENDING') {
+            await deps.redis.set(reqKey(key), waiting, 'EX', approvedTtl);
+            return pending(
+              waiting,
+              `Identical to request ${waiting}, which is waiting for approval in DharaHIL. Nothing new was filed; request ${waiting}'s content is what will be carried out once approved. Do not retry.`
+            );
+          }
+          if (state.status !== 'APPROVED') {
+            await deps.redis.del(joinKey(input.org, fingerprint));
+          } else {
+            await deps.redis.set(reqKey(key), waiting, 'EX', approvedTtl);
+            return read(cfg, key, waiting, input);
+          }
+        }
       }
-      // a reworded retry of a request still waiting: join it, file nothing
-      const pendingBy = await deps.redis.get(pendingTargetKey(target));
-      if (pendingBy && (await deps.redis.get(pendingKey(pendingBy)))) {
-        await deps.redis.set(reqKey(key), pendingBy, 'EX', approvedTtl);
-        return pending(
-          pendingBy,
-          `A request for this is already waiting in DharaHIL (request ${pendingBy}); no duplicate was filed. Postiz carries it out automatically once approved: do not retry.`
-        );
+
+      const verdict = await input.guard.check(input.args, input.org, 'request', []);
+      if (verdict.refuse) {
+        return { status: 'refused', duplicate: true, message: verdict.refuse };
+      }
+      if (verdict.warn) {
+        reason = `${verdict.warn}\n\n${reason}`;
+        shown = verdict.shown || [];
       }
     }
 
@@ -413,7 +494,7 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       tool_name: input.action,
       tool_args: input.args,
       tool_args_redacted: redact(input.args),
-      context_summary: input.reason,
+      context_summary: reason,
       risk_level: 'HIGH',
       environment: 'production',
       tags: ['postiz', input.action],
@@ -453,15 +534,15 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
           org: input.org,
           args: input.args,
           key,
-          target: input.target,
+          shown,
         }),
         'EX',
         ttlUntil(created.expires_at) + approvedTtl
       );
       await deps.redis.sadd(pendingSet, created.request_id);
-      if (target) {
+      if (fingerprint) {
         await deps.redis.set(
-          pendingTargetKey(target),
+          joinKey(input.org, fingerprint),
           created.request_id,
           'EX',
           ttlUntil(created.expires_at) + approvedTtl
@@ -543,13 +624,7 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
         continue;
       }
       // one unreadable entry must not stop every other approval
-      let item: {
-        action: string;
-        org: string;
-        args: any;
-        key: string;
-        target?: string;
-      };
+      let item: { action: string; org: string; args: any; key: string };
       try {
         item = JSON.parse(raw);
       } catch {
@@ -568,9 +643,9 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
           org: item.org,
           args: item.args,
           reason: '',
-          target: item.target,
           validate: executor.validate,
           isNoop: executor.isNoop,
+          guard: executor.guard,
           execute: (args) => executor.execute(item.org, args),
         });
         if (decision.status !== 'pending') {

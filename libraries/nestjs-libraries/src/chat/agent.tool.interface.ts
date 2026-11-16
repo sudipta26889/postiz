@@ -1,3 +1,4 @@
+import type { ApprovalGuard } from '@gitroom/nestjs-libraries/chat/human.approval';
 import type { ToolAction } from '@mastra/core/tools';
 
 export type ToolReturn = ToolAction<any, any, any, any, any, any>;
@@ -16,8 +17,7 @@ export interface AgentToolInterface {
   approval?(args: any, orgId: string): string | null | Promise<string | null>;
   // checks for args a human edited before they run, a reason to refuse or null
   approvalValidate?(args: any, orgId: string): Promise<string | null>;
-  // what a gated call is about, however it is worded (see human.approval.ts
-  // DecideInput.target): stops duplicate approvals and double runs
-  approvalTarget?(args: any): string;
+  // duplicate protection for a tool that creates posts (human.approval.ts)
+  approvalGuard?: ApprovalGuard;
   run(): ToolReturn;
 }

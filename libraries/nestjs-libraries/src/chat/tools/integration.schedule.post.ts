@@ -3,13 +3,16 @@ import { createTool } from '@mastra/core/tools';
 import { z } from 'zod';
 import { Injectable } from '@nestjs/common';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
-import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
+import {
+  ApprovalPostItem,
+  PostsService,
+} from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
 import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 import { AllProvidersSettings } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/all.providers.settings';
 import { Integration } from '@prisma/client';
 import { checkAuth } from '@gitroom/nestjs-libraries/chat/auth.context';
 import {
-  postTarget,
+  ApprovalGuard,
   publishReason,
 } from '@gitroom/nestjs-libraries/chat/human.approval';
 import {
@@ -76,9 +79,32 @@ export class IntegrationSchedulePostTool implements AgentToolInterface {
   ) {}
   name = 'integrationSchedulePostTool';
   approval = scheduleApproval;
-  approvalTarget = (args: {
-    socialPost?: { integrationId?: string; date?: string; type?: string }[];
-  }) => postTarget(args?.socialPost || []);
+
+  // The posts this call would publish (drafts never do), as the duplicate
+  // check sees them; the check itself is PostsService's, shared with REST
+  private approvalItems(args: any): ApprovalPostItem[] {
+    return (args?.socialPost || [])
+      .filter((p: any) => p?.type !== 'draft')
+      .map((p: any) => ({
+        integrationId: p.integrationId,
+        content: p.postsAndComments?.[0]?.content || '',
+        media: p.postsAndComments?.[0]?.attachments || [],
+      }));
+  }
+
+  approvalGuard: ApprovalGuard = {
+    fingerprint: (args) =>
+      this._postsService.approvalFingerprint(this.approvalItems(args)),
+    locks: (args, org) =>
+      this._postsService.approvalLocks(org, this.approvalItems(args)),
+    check: (args, org, phase, shown) =>
+      this._postsService.approvalDuplicateCheck(
+        org,
+        this.approvalItems(args),
+        phase,
+        shown
+      ),
+  };
 
   // A human may have edited the approved args: every channel must still be
   // one of this organization's (the rest of the checks run in execute)

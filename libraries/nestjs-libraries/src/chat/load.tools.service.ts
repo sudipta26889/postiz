@@ -78,7 +78,7 @@ export class LoadToolsService {
       toolName: p.name,
       approval: (args, orgId) => p.approval!(args, orgId),
       validate,
-      target: p.approvalTarget ? (args) => p.approvalTarget!(args) : undefined,
+      guard: p.approvalGuard,
       execute,
     });
 
@@ -87,6 +87,7 @@ export class LoadToolsService {
     approvalGate.registerExecutor(p.name, {
       validate,
       isNoop,
+      guard: p.approvalGuard,
       execute: async (orgId, args) => {
         const org = await this._moduleRef
           .get(OrganizationService, { strict: false })

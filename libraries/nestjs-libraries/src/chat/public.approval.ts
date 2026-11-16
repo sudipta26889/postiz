@@ -13,10 +13,14 @@ export const createPublicApproval = (gate = approvalGate) => ({
   run: async <T>(
     input: Omit<DecideInput<T>, 'isNoop' | 'releaseOnError'>
   ): Promise<T> => {
-    // No claim is ever released on error here: a failed run may already have
-    // written something (a multi-post create), so its approval is used up and
-    // a repeat answers 409 instead of running again
-    const decision = await gate.decide<T>(input);
+    // A claim is released only for a 404 (the thing is already gone: nothing
+    // was done). Any other failure may have written something (a multi-post
+    // create), so its approval is used up and a repeat answers 409
+    const decision = await gate.decide<T>({
+      ...input,
+      releaseOnError: (err) =>
+        err instanceof HttpException && err.getStatus() === 404,
+    });
 
     switch (decision.status) {
       case 'executed':
@@ -37,10 +41,11 @@ export const createPublicApproval = (gate = approvalGate) => ({
       case 'running':
         throw new HttpException({ msg: decision.message }, 409);
       default:
-        // the service failed (503), or a human or the policy said no (403)
+        // the service failed (503), a duplicate of something that exists
+        // (409), or a human or the policy said no (403)
         throw new HttpException(
           { msg: decision.message },
-          decision.unavailable ? 503 : 403
+          decision.unavailable ? 503 : decision.duplicate ? 409 : 403
         );
     }
   },

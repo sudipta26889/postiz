@@ -4,7 +4,6 @@ import { z } from 'zod';
 import { Injectable } from '@nestjs/common';
 import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
 import { checkAuth } from '@gitroom/nestjs-libraries/chat/auth.context';
-import { canonicalJson } from '@gitroom/nestjs-libraries/chat/human.approval';
 
 @Injectable()
 export class PostSettingsTool implements AgentToolInterface {
@@ -14,9 +13,6 @@ export class PostSettingsTool implements AgentToolInterface {
   // only a scheduled (QUEUE) post's settings change what goes out, so only
   // those ask a human (DharaHIL); drafts are free, and the tool refuses any
   // other state itself instead of paging a person for nothing
-  approvalTarget = (args: { id: string; settings?: unknown }) =>
-    `post:${args.id}:settings:${canonicalJson(args.settings ?? null)}`;
-
   approval = async (args: { id: string }, orgId: string) => {
     const snapshot = await this._postsService.approvalSnapshot(orgId, args.id);
     return snapshot.state !== 'QUEUE'

@@ -1,4 +1,7 @@
-import { approvalGate } from '@gitroom/nestjs-libraries/chat/human.approval';
+import {
+  approvalGate,
+  ApprovalGuard,
+} from '@gitroom/nestjs-libraries/chat/human.approval';
 import {
   getAuth,
   getContext,
@@ -13,8 +16,7 @@ export interface WithApprovalOptions {
   approval: (args: any, orgId: string) => string | null | Promise<string | null>;
   // extra checks on args a human edited, a reason to refuse or null
   validate?: (args: any, orgId: string) => Promise<string | null> | string | null;
-  // what the call is about, however it is worded (human.approval.ts)
-  target?: (args: any) => string;
+  guard?: ApprovalGuard;
   execute: (inputData: any, context: any) => Promise<any>;
 }
 
@@ -56,8 +58,8 @@ export const createMcpApproval = (gate = approvalGate) => ({
         org,
         args: inputData,
         reason,
-        target: opts.target?.(inputData),
         validate: opts.validate,
+        guard: opts.guard,
         execute: (args) => opts.execute(args, context),
         // a tool answering with errors did nothing: the claim is released
         isNoop: (result) => !!result?.output?.errors,

@@ -1,7 +1,6 @@
 import {
   approvalKey,
   canonicalJson,
-  postTarget,
   createApprovalGate,
   publishReason,
 } from '@gitroom/nestjs-libraries/chat/human.approval';
@@ -16,11 +15,12 @@ const json = (body: any, status = 200) => ({
 const setup = (answers: any[], hasRedis = true) => {
   const data = new Map<string, string>();
   const queue = [...answers];
-  const fetch = jest.fn(async () => queue.shift() ?? json({}));
   const gate = createApprovalGate({
-    fetch: fetch as any,
+    fetch: (async () => queue.shift() ?? json({})) as any,
     redis: {
       get: async (k: string) => data.get(k) ?? null,
+      // the lock release script: delete only if the token still matches
+      eval: async (_script: string, _n: number, k: string, token: string) => (data.get(k) === token ? (data.delete(k), 1) : 0),
       set: async (k: string, v: string, ...o: any[]) => {
         if (o.includes('NX') && data.has(k)) return null;
         data.set(k, v);
@@ -36,7 +36,7 @@ const setup = (answers: any[], hasRedis = true) => {
     hasRedis: () => hasRedis,
     config: () => ({ baseUrl: 'https://hil', tenantId: 't', appId: 'a', apiKey: 'k' }),
   });
-  return { gate, data, fetch };
+  return { gate, data };
 };
 
 const created = json({
@@ -268,89 +268,165 @@ describe('sweep robustness', () => {
   });
 });
 
-describe('duplicates: a target is approved and carried out once', () => {
+describe('duplicate guard (G4 v3)', () => {
   beforeEach(() => {
     (globalThis as any).__sets = {};
   });
 
-  const withTarget = (args: any, execute = jest.fn()) => ({
-    ...input(execute),
-    args,
-    target: 'post:p1',
-  });
-  const posts = (fetch: jest.Mock) =>
-    fetch.mock.calls.filter(
-      ([url, init]: any) => init?.method === 'POST' && url.endsWith('/v1/requests')
-    ).length;
-
-  it('joins a reworded retry to the request already waiting, filing nothing new', async () => {
-    const { gate, fetch } = setup([created]);
-    const first = await gate.decide(withTarget({ id: 'p1' }));
-    const reworded = await gate.decide(withTarget({ id: 'p1', note: 'please' }));
-    expect(first).toMatchObject({ status: 'pending', requestId: 'req1' });
-    expect(reworded).toMatchObject({ status: 'pending', requestId: 'req1' });
-    expect((reworded as any).message).toMatch(/no duplicate was filed/);
-    expect(posts(fetch)).toBe(1);
-  });
-
-  it('does not ask again once the target was carried out', async () => {
-    const { gate, fetch } = setup([created, approved, json({})]);
-    const run = jest.fn(async () => 'ok');
-    gate.registerExecutor('public.posts.delete', { execute: run });
-    await gate.decide(withTarget({ id: 'p1' }));
-    await gate.sweep();
-    expect(run).toHaveBeenCalledTimes(1);
-
-    const later = await gate.decide(withTarget({ id: 'p1', note: 'again' }));
-    expect(later.status).toBe('done');
-    expect(posts(fetch)).toBe(1);
-  });
-
-  it('runs only one of two separately filed requests for the same target', async () => {
-    const created2 = json({
-      request_id: 'req2',
-      version: 1,
-      status: 'PENDING',
-      expires_at: expiresAt,
+  // a gate whose fetch calls can be inspected
+  const guardedSetup = (answers: any[]) => {
+    const data = new Map<string, string>();
+    const queue = [...answers];
+    const fetch = jest.fn(async () => queue.shift() ?? json({}));
+    const gate = createApprovalGate({
+      fetch: fetch as any,
+      redis: {
+        get: async (k: string) => data.get(k) ?? null,
+        eval: async (_s: string, _n: number, k: string, token: string) =>
+          data.get(k) === token ? (data.delete(k), 1) : 0,
+        set: async (k: string, v: string, ...o: any[]) => {
+          if (o.includes('NX') && data.has(k)) return null;
+          data.set(k, v);
+          return 'OK';
+        },
+        del: async (k: string) => (data.delete(k) ? 1 : 0),
+        expire: async () => 1,
+        sadd: async (k: string, v: string) => {
+          const set = new Set(JSON.parse((globalThis as any).__sets?.[k] ?? '[]'));
+          set.add(v);
+          ((globalThis as any).__sets ??= {})[k] = JSON.stringify([...set]);
+          return 1;
+        },
+        srem: async (k: string, v: string) => {
+          const set = new Set(JSON.parse((globalThis as any).__sets?.[k] ?? '[]'));
+          set.delete(v);
+          ((globalThis as any).__sets ??= {})[k] = JSON.stringify([...set]);
+          return 1;
+        },
+        smembers: async (k: string) => JSON.parse((globalThis as any).__sets?.[k] ?? '[]'),
+      } as any,
+      hasRedis: () => true,
+      config: () => ({ baseUrl: 'https://hil', tenantId: 't', appId: 'a', apiKey: 'k' }),
     });
-    const approved2 = json({
+    const filed = () =>
+      fetch.mock.calls.filter(
+        ([url, init]: any) => init?.method === 'POST' && url.endsWith('/v1/requests')
+      );
+    const reportedNotExecuted = () =>
+      fetch.mock.calls.filter(
+        ([url, init]: any) =>
+          url.endsWith('/executed') && JSON.parse(init.body).executed === false
+      );
+    return { gate, data, fetch, filed, reportedNotExecuted };
+  };
+
+  const approvedPost = (extra: any = {}) =>
+    json({
       status: 'APPROVED',
       last_decision_by: { email: 'owner@example.test' },
       version: 2,
-      metadata: { org: 'org1', tool: 'public.posts.delete' },
-      approved_args: { id: 'p1', note: 'x' },
+      metadata: { org: 'org1', tool: 'public.posts.create' },
+      ...extra,
     });
-    const { gate, data } = setup([created, created2, approved, json({}), approved2]);
-    const run = jest.fn(async () => 'ok');
-    gate.registerExecutor('public.posts.delete', { execute: run });
 
-    await gate.decide(withTarget({ id: 'p1' }));
-    // the first request's target index expired: a second request gets filed
-    for (const k of [...data.keys()]) {
-      if (k.startsWith('hil:target:pending:')) data.delete(k);
-    }
-    expect((await gate.decide(withTarget({ id: 'p1', note: 'x' }))).requestId).toBe('req2');
+  const guard = (opts: {
+    fingerprint?: string | null;
+    request?: any;
+    execute?: any;
+  } = {}) => ({
+    fingerprint: jest.fn(() => opts.fingerprint ?? 'fp-1'),
+    locks: jest.fn(() => ['post:org1:loose-1']),
+    check: jest.fn(async (_a: any, _o: string, phase: string) =>
+      phase === 'request' ? opts.request ?? {} : opts.execute ?? {}
+    ),
+  });
 
+  const postInput = (g: any, args: any = { text: 'hello' }, execute = jest.fn(async () => 'posted')) => ({
+    action: 'public.posts.create',
+    org: 'org1',
+    args,
+    reason: 'Publishing or scheduling a post',
+    guard: g,
+    execute,
+  });
+
+  it('refuses an exact copy at request time and files nothing', async () => {
+    const { gate, filed } = guardedSetup([]);
+    const result = await gate.decide(
+      postInput(guard({ request: { refuse: 'This exact post already exists: post X' } }))
+    );
+    expect(result).toMatchObject({ status: 'refused', duplicate: true });
+    expect((result as any).message).toMatch(/already exists/);
+    expect(filed()).toHaveLength(0);
+  });
+
+  it('files a look-alike with the warning first and remembers what was shown', async () => {
+    const { gate, filed, data } = guardedSetup([created]);
+    await gate.decide(
+      postInput(guard({ request: { warn: '⚠ Resembles post X', shown: ['X'] } }))
+    );
+    const body = JSON.parse((filed()[0] as any)[1].body);
+    expect(body.context_summary).toMatch(/^⚠ Resembles post X/);
+    expect(JSON.parse(data.get('hil:pending:req1')!).shown).toEqual(['X']);
+  });
+
+  it('joins a reworded retry to the identical request still waiting', async () => {
+    const { gate, filed } = guardedSetup([created, json({ status: 'PENDING' })]);
+    await gate.decide(postInput(guard(), { text: 'hello' }));
+    const again = await gate.decide(postInput(guard(), { text: 'HELLO ', extra: 1 }));
+    expect(again).toMatchObject({ status: 'pending', requestId: 'req1' });
+    expect((again as any).message).toMatch(/Identical to request req1/);
+    expect(filed()).toHaveLength(1);
+  });
+
+  it('does not join a request that was rejected meanwhile: files a new one', async () => {
+    const created2 = json({ request_id: 'req2', version: 1, status: 'PENDING', expires_at: expiresAt });
+    const { gate, filed } = guardedSetup([created, json({ status: 'REJECTED' }), created2]);
+    await gate.decide(postInput(guard(), { text: 'hello' }));
+    const again = await gate.decide(postInput(guard(), { text: 'hello', v: 2 }));
+    expect(again).toMatchObject({ status: 'pending', requestId: 'req2' });
+    expect(filed()).toHaveLength(2);
+  });
+
+  it('never runs a duplicate at execution: reports not executed, runs nothing', async () => {
+    const { gate, reportedNotExecuted } = guardedSetup([created, approvedPost(), json({})]);
+    const run = jest.fn();
+    const g = guard({ execute: { refuse: 'This exact post already exists: post X. Nothing was posted.' } });
+    gate.registerExecutor('public.posts.create', { execute: run, guard: g });
+    await gate.decide(postInput(g));
+    await gate.sweep();
+    expect(run).not.toHaveBeenCalled();
+    expect(reportedNotExecuted()).toHaveLength(1);
+    expect(JSON.parse((globalThis as any).__sets['hil:pending'])).toEqual([]);
+  });
+
+  it('waits (never runs, never refuses) while another run holds the lock', async () => {
+    const { gate, data } = guardedSetup([created, approvedPost(), approvedPost(), json({})]);
+    const run = jest.fn(async () => 'posted');
+    const g = guard();
+    gate.registerExecutor('public.posts.create', { execute: run, guard: g });
+    await gate.decide(postInput(g));
+    data.set('hil:lock:post:org1:loose-1', 'someone-else');
+    await gate.sweep();
+    expect(run).not.toHaveBeenCalled();
+    expect(JSON.parse((globalThis as any).__sets['hil:pending'])).toEqual(['req1']);
+
+    data.delete('hil:lock:post:org1:loose-1');
     await gate.sweep();
     expect(run).toHaveBeenCalledTimes(1);
+    // our lock is released afterwards
+    expect(data.has('hil:lock:post:org1:loose-1')).toBe(false);
   });
-});
 
-describe('postTarget', () => {
-  it('ignores date format and item order, and keeps channel, minute and type', () => {
-    const a = postTarget([
-      { integrationId: 'i2', date: '2026-12-01T10:00:00Z', type: 'schedule' },
-      { integrationId: 'i1', date: '2026-12-01T10:00:30.000Z', type: 'schedule' },
-    ]);
-    const b = postTarget([
-      { integrationId: 'i1', date: '2026-12-01T15:30:00+05:30', type: 'schedule' },
-      { integrationId: 'i2', date: 'Tue, 01 Dec 2026 10:00:00 GMT', type: 'schedule' },
-    ]);
-    expect(b).toBe(a);
-    expect(
-      postTarget([{ integrationId: 'i1', date: '2026-12-01T10:01:00Z', type: 'schedule' }])
-    ).not.toBe(
-      postTarget([{ integrationId: 'i1', date: '2026-12-01T10:00:00Z', type: 'schedule' }])
-    );
+  it('decides with what the approver was shown, and runs the args they saw', async () => {
+    const { gate } = guardedSetup([created, approvedPost(), json({})]);
+    const run = jest.fn(async () => 'posted');
+    const g = guard({ request: { warn: '⚠ Resembles post X', shown: ['X'] } });
+    gate.registerExecutor('public.posts.create', { execute: run, guard: g });
+    await gate.decide(postInput(g, { text: 'as filed' }));
+    await gate.sweep();
+    expect(g.check).toHaveBeenLastCalledWith({ text: 'as filed' }, 'org1', 'execute', ['X']);
+    // no approved_args from DharaHIL: the stored, filed args run
+    expect(run).toHaveBeenCalledWith('org1', { text: 'as filed' });
   });
 });

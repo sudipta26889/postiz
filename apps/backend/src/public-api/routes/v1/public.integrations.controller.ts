@@ -23,7 +23,10 @@ import { GetOAuthUserIdFromRequest } from '@gitroom/nestjs-libraries/user/oauth.
 import { Organization } from '@prisma/client';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
 import { CheckPolicies } from '@gitroom/backend/services/auth/permissions/permissions.ability';
-import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
+import {
+  ApprovalPostItem,
+  PostsService,
+} from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { MediaService } from '@gitroom/nestjs-libraries/database/prisma/media/media.service';
 import { GetPostsDto } from '@gitroom/nestjs-libraries/dtos/posts/get.posts.dto';
@@ -47,8 +50,7 @@ import { publishReason } from '@gitroom/nestjs-libraries/chat/human.approval';
 import { publicApproval } from '@gitroom/nestjs-libraries/chat/public.approval';
 import {
   approvalGate,
-  canonicalJson,
-  postTarget,
+  ApprovalGuard,
 } from '@gitroom/nestjs-libraries/chat/human.approval';
 import {
   socialIntegrationList,
@@ -96,6 +98,10 @@ export class PublicIntegrationsController implements OnModuleInit {
     'public.posts.create': (org, args) => this.runCreatePost(org, args),
     'public.posts.delete': async (org, args) => {
       const getPostById = await this._postsService.getPost(org.id, args.id);
+      // already gone: nothing to do, said plainly (not an unknown outcome)
+      if (!getPostById) {
+        throw new HttpException({ msg: 'Post not found, nothing deleted' }, 404);
+      }
       return this._postsService.deletePost(org.id, getPostById.group);
     },
     'public.posts.deleteGroup': (org, args) =>
@@ -132,9 +138,57 @@ export class PublicIntegrationsController implements OnModuleInit {
     },
   };
 
+  // Duplicate protection for the routes that publish (design G4 v3); the
+  // decision is PostsService's, the same one the MCP schedule tool uses
+  private publishItems(args: any): ApprovalPostItem[] {
+    if (args?.type === 'draft') {
+      return [];
+    }
+    return (Array.isArray(args?.posts) ? args.posts : []).map((p: any) => ({
+      integrationId: p?.integration?.id,
+      content: p?.value?.[0]?.content || '',
+      media: p?.value?.[0]?.image || [],
+    }));
+  }
+
+  private approvalGuards: Record<string, ApprovalGuard> = {
+    'public.posts.create': {
+      fingerprint: (args) =>
+        this._postsService.approvalFingerprint(this.publishItems(args)),
+      locks: (args, org) =>
+        this._postsService.approvalLocks(org, this.publishItems(args)),
+      check: (args, org, phase, shown) =>
+        this._postsService.approvalDuplicateCheck(
+          org,
+          this.publishItems(args),
+          phase,
+          shown
+        ),
+    },
+    // the draft already exists: it can't double itself, but its text may
+    // already be queued or published on that channel by another post
+    'public.posts.status': {
+      fingerprint: () => null,
+      locks: async (args, org) =>
+        this._postsService.approvalLocks(
+          org,
+          await this._postsService.approvalItemsOfPost(org, args.id)
+        ),
+      check: async (args, org, phase, shown) =>
+        this._postsService.approvalDuplicateCheck(
+          org,
+          await this._postsService.approvalItemsOfPost(org, args.id),
+          phase,
+          shown,
+          args.id
+        ),
+    },
+  };
+
   onModuleInit() {
     for (const [action, run] of Object.entries(this.approvedActions)) {
       approvalGate.registerExecutor(action, {
+        guard: this.approvalGuards[action],
         execute: async (orgId, args) => {
           const org =
             await this._organizationService.getOrgByIdWithSubscription(orgId);
@@ -230,14 +284,8 @@ export class PublicIntegrationsController implements OnModuleInit {
       org: org.id,
       args: rawBody,
       reason,
-      target: postTarget(
-        (Array.isArray(rawBody?.posts) ? rawBody.posts : []).map((p: any) => ({
-          integrationId: p?.integration?.id,
-          date: rawBody?.date,
-          type: rawBody?.type,
-        }))
-      ),
       // an approved edit goes through every check below again
+      guard: this.approvalGuards['public.posts.create'],
       execute: (args) => this.approvedActions['public.posts.create'](org, args),
     });
   }
@@ -334,7 +382,6 @@ export class PublicIntegrationsController implements OnModuleInit {
       action: 'public.posts.delete',
       org: org.id,
       args: { id },
-      target: `post:${id}`,
       reason: 'Deleting a post cannot be undone',
       execute: (args) => this.approvedActions['public.posts.delete'](org, args),
     });
@@ -350,7 +397,6 @@ export class PublicIntegrationsController implements OnModuleInit {
       action: 'public.posts.deleteGroup',
       org: org.id,
       args: { group },
-      target: `group:${group}`,
       reason: 'Deleting a post group cannot be undone',
       execute: (args) =>
         this.approvedActions['public.posts.deleteGroup'](org, args),
@@ -698,7 +744,6 @@ export class PublicIntegrationsController implements OnModuleInit {
       action: 'public.integrations.delete',
       org: org.id,
       args: { id },
-      target: `integration:${id}`,
       reason: 'Deleting a channel and its posts cannot be undone',
       execute: (args) =>
         this.approvedActions['public.integrations.delete'](org, args),
@@ -783,7 +828,6 @@ export class PublicIntegrationsController implements OnModuleInit {
     return publicApproval.run({
       action: 'public.posts.settings',
       org: org.id,
-      target: `post:${id}:settings:${canonicalJson(body.settings ?? null)}`,
       args: { id, settings: body.settings, snapshot: snapshot.hash },
       reason: `Changing the settings of a scheduled post: "${snapshot.preview}"`,
       execute: (args) =>
@@ -821,9 +865,9 @@ export class PublicIntegrationsController implements OnModuleInit {
     return publicApproval.run({
       action: 'public.posts.status',
       org: org.id,
-      target: `post:${id}:status:${body?.status}`,
       args: { id, status: body?.status, snapshot: snapshot.hash },
       reason: `Scheduling a draft to be posted: "${snapshot.preview}"`,
+      guard: this.approvalGuards['public.posts.status'],
       execute: (args) => this.approvedActions['public.posts.status'](org, args),
     });
   }

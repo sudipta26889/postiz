@@ -242,24 +242,81 @@ Change:
 - The agent's message now says the action runs automatically once approved and must not be retried or changed.
   A repeat only reports status (`done` after the sweep ran it).
 
-## Phase G4: duplicates are approved and carried out once (2026-11-17)
+## Phase G4 (v3): duplicates, decided from what is actually posted (2026-11-17)
 
-Problem: with G3, every approved request runs. A reworded retry by an agent is a separate request, so approving both
-would post twice.
+History:
+- v1 (commit 4ec04b3b) keyed on channel + minute + action name and was blocked: it doubled posts and dropped real ones.
+- v2 (design only) kept its own Redis ledger of what ran, and was sent back: the ledger expired before far-future
+  posts went out, didn't notice deletes, ignored media, and needed multi-key atomic moves.
 
-Change: every gated action declares a **target**, meaning what it is about regardless of wording:
-- posts (`postTarget`, shared by the MCP schedule tool and `POST /public/v1/posts`): each channel, the minute it goes
-  out (any date format), and the type;
-- deletes: `post:<id>`, `group:<group>`, `integration:<id>`;
-- settings: `post:<id>:settings:<canonical settings>`;
-- status: `post:<id>:status:<status>`.
+v3 asks Postgres directly, as the record of what is really queued or published, and uses Redis only for short locks
+and the pending-request pointer.
 
-Rules, keyed by `org|action|target`:
-- While a request for a target is pending (`hil:target:pending:*`), a new call for the same target joins it. No
-  second request is filed.
-- Once a target was carried out (`hil:target:done:*`, 24 h), a new call answers "already done" without asking a
-  person. A separately filed request for the same target is refused before its claim.
-- A rejected or expired request releases its pending target.
+**Requirements.** (A) An agent never causes the same post or delete twice, however it retries: reworded fields,
+another date format, "now" retries, split or merged channels, MCP or REST. (B) A genuinely different post is never
+silently dropped, and nothing is reported as success when it didn't run. Anything ambiguous goes to the owner with
+context.
+
+### Identity of a post item (revised after the v3 review)
+Only the **main post** counts (the first item; comments are stored separately through `parentPostId`, so they're left
+out). Two fingerprints per channel item:
+- **exact** = `channelId + sha256(normText(withUrls) + "\u0001" + sorted media PATHS)`;
+- **loose** = `channelId + sha256(normText(withoutUrls))`.
+
+`normText`:
+- turn `</p>`, `<br>` and block tags into a space, then strip tags;
+- decode entities, apply NFC, drop zero-width characters;
+- collapse whitespace, trim and lower-case;
+- keep the mention ids.
+
+Media ids are never used. The MCP tool makes new ids, and `convertToJPEG` re-uploads under new paths. The minute,
+type, settings and path (MCP or REST) are left out, so both compute the same fingerprints through one shared function.
+
+### At execution (sweep or repeat): the safety rule
+For each channel item of a create (MCP schedule tool, `POST /public/v1/posts`) or a draft → schedule move:
+1. **Locks.** Take `hil:lock:post:<org>:<loose>` with `SET key <random token> NX PX 300000`, in sorted order. If any
+   is held elsewhere, release the ones taken (Lua compare-and-delete on the token) and wait for the next sweep: never
+   refuse, never run. Release the same way when done.
+2. **Postgres read** (new repository method, no raw SQL): `post.findMany` where `organizationId`, `integrationId in
+   channels`, `deletedAt null`, `parentPostId null`, and (state QUEUE, or state PUBLISHED/ERROR with `publishDate`
+   ≥ 7 days ago). Select `id, integrationId, content, image, state, publishDate`. A draft → schedule move excludes
+   its own post. This is covered by the existing index (`schema.prisma:502`).
+3. **Compare.**
+   - **Exact** match with a QUEUE or PUBLISHED post → **refuse the whole request**. `/executed` false: "duplicate of
+     post X on channel Y". Nothing runs.
+   - **Near** match (same loose fingerprint but not exact: links differ, images re-saved, or the earlier post is in
+     ERROR) → run **only if** the post ids it resembles are among those the owner was shown in this request's
+     warning (stored with the pending entry). Otherwise refuse as above: "resembles post X, which the owner wasn't
+     shown".
+   - No match → create.
+
+### At request time (to spare and inform the owner, not for safety)
+The same read and compare, with no locks:
+- exact match → error to the agent (MCP `isError`, REST 409): "This exact post already exists as X on Y". Nothing
+  filed;
+- near match → file, with the DharaHIL summary starting "⚠ Resembles post X on Y (<state>, <date>): '<preview>'".
+  The ids shown are stored with the pending entry (rule 3);
+- an identical request already pending → join it after re-reading its status; a dead one's pointer is dropped. The
+  agent is told R's content is what will run and nothing new was filed;
+- a pending request on the same channel with a different fingerprint → file, with "⚠ Possible duplicate of pending
+  request R".
+
+### No-op, failure, partial crash
+- A no-op (validation error, or a delete of a missing post or channel: an explicit not-found check, not a crash) →
+  `/executed` false with the reason, and the pending entry is dropped. REST executors register `isNoop` for
+  `PostValidationException` and not-found.
+- An exception after a possible write: whatever was written is in Postgres, so rule 3 catches a retry. The error
+  given to the agent lists the channels that **were not** posted ("resend those alone"), worked out from the same
+  read.
+- Sweep: one sweep at a time per process. Across replicas the per-identity locks plus the Postgres read rule out
+  doubles, so no global sweep lock is needed.
+
+### Explicitly accepted
+- An exact repeat (same text, same links, same images) on the same channel while the earlier one is queued, or was
+  published in the last 7 days, is refused with the reason. A deliberate repost is done in the web app.
+- Posts that differ only in their comments count as the same post.
+- DharaHIL has no cancel endpoint. A request joined after a race stays in the owner's queue, and rule 3 stops it from
+  posting twice.
 
 ## Phase H1: hardening with no schema change (revised)
 

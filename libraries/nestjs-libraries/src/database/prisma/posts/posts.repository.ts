@@ -1281,6 +1281,37 @@ export class PostsRepository {
     });
   }
 
+  // The posts an approved agent post could duplicate: live main posts on
+  // these channels, queued, or published/failed in the last week
+  getRecentChannelPosts(
+    orgId: string,
+    integrationIds: string[],
+    since: Date,
+    excludePostId?: string
+  ) {
+    return this._post.model.post.findMany({
+      where: {
+        organizationId: orgId,
+        integrationId: { in: integrationIds },
+        deletedAt: null,
+        parentPostId: null,
+        ...(excludePostId ? { id: { not: excludePostId } } : {}),
+        OR: [
+          { state: 'QUEUE' },
+          { state: { in: ['PUBLISHED', 'ERROR'] }, publishDate: { gte: since } },
+        ],
+      },
+      select: {
+        id: true,
+        integrationId: true,
+        content: true,
+        image: true,
+        state: true,
+        publishDate: true,
+      },
+    });
+  }
+
   async getPostsSince(orgId: string, since: string) {
     return this._post.model.post.findMany({
       where: {

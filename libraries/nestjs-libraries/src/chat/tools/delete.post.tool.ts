@@ -11,7 +11,6 @@ export class DeletePostTool implements AgentToolInterface {
   name = 'deletePostTool';
   optionalOnSelfHosted = true;
   approval = () => 'Deleting a post cannot be undone';
-  approvalTarget = (args: { id: string }) => `post:${args.id}`;
 
   run() {
     return createTool({

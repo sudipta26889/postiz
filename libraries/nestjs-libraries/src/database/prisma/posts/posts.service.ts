@@ -65,6 +65,13 @@ type PostWithConditionals = Post & {
   childrenPost: Post[];
 };
 
+// A post item an agent asks to publish, as both MCP and REST describe it
+export interface ApprovalPostItem {
+  integrationId: string;
+  content: string;
+  media: unknown;
+}
+
 @Injectable()
 export class PostsService {
   private storage = UploadFactory.createStorage();
@@ -521,6 +528,185 @@ export class PostsService {
         )
         .digest('hex'),
     };
+  }
+
+  // --- Duplicates of agent posts a person approves (DharaHIL) -------------
+  // A post's text as a person reads it: tags gone (blocks become spaces),
+  // entities decoded, mention ids kept, invisible characters dropped. URLs
+  // are dropped for the loose fingerprint, because link shortening rewrites
+  // them before saving
+  private approvalText(html: string, keepUrls: boolean) {
+    const text = stripHtmlValidation(
+      'none',
+      (html || '')
+        .replace(/<span[^>]*data-id="([^"]+)"[^>]*>/gi, ' @$1 ')
+        .replace(/<\/(p|h1|h2|h3|li|ul|ol|div)>|<br\s*\/?>/gi, ' ')
+    )
+      .normalize('NFC')
+      .replace(/[\u200B-\u200D\uFEFF]/g, '');
+    return (keepUrls ? text : text.replace(/https?:\/\/\S+/gi, ' '))
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
+  // Media by path only: ids are new on every MCP call
+  private approvalMedia(image: unknown): string[] {
+    let list: unknown = image;
+    if (typeof image === 'string') {
+      try {
+        list = JSON.parse(image);
+      } catch {
+        list = [];
+      }
+    }
+    return (Array.isArray(list) ? list : [])
+      .map((m: any) => (typeof m === 'string' ? m : m?.path))
+      .filter((path: unknown): path is string => typeof path === 'string')
+      .sort();
+  }
+
+  // exact: same channel, text with its links, and media; loose: same channel
+  // and text without links (what a shortened or re-uploaded copy keeps)
+  approvalFingerprints(item: ApprovalPostItem) {
+    const hash = (value: string) =>
+      createHash('sha256').update(value).digest('hex').slice(0, 32);
+    return {
+      exact: hash(
+        `${item.integrationId}|${this.approvalText(item.content, true)}\u0001${this.approvalMedia(item.media).join('\u0002')}`
+      ),
+      loose: hash(
+        `${item.integrationId}|${this.approvalText(item.content, false)}`
+      ),
+    };
+  }
+
+  // A stored post as an approval item (a draft about to be scheduled)
+  async approvalItemsOfPost(
+    orgId: string,
+    postId: string
+  ): Promise<ApprovalPostItem[]> {
+    const [root] = await this.getPostsRecursively(postId, false, orgId, true);
+    return root
+      ? [
+          {
+            integrationId: root.integrationId,
+            content: root.content,
+            media: root.image,
+          },
+        ]
+      : [];
+  }
+
+  // One id for "these posts", to join an identical request still waiting
+  approvalFingerprint(items: ApprovalPostItem[]) {
+    return items
+      .map((item) => this.approvalFingerprints(item).exact)
+      .sort()
+      .join(',');
+  }
+
+  // Locks held while an approved post runs, so two runs can't both pass the
+  // duplicate check
+  approvalLocks(orgId: string, items: ApprovalPostItem[]) {
+    return [
+      ...new Set(
+        items.map(
+          (item) => `post:${orgId}:${this.approvalFingerprints(item).loose}`
+        )
+      ),
+    ].sort();
+  }
+
+  // The duplicate decision for agent posts (design: mcp-oauth.md, G4 v3).
+  // At request time it informs (refuse an exact copy, warn on a resemblance);
+  // at execution it decides: an exact copy never runs, and a resemblance runs
+  // only if the person was shown it
+  async approvalDuplicateCheck(
+    orgId: string,
+    items: ApprovalPostItem[],
+    phase: 'request' | 'execute',
+    shown: string[] = [],
+    excludePostId?: string
+  ): Promise<{ refuse?: string; warn?: string; shown?: string[] }> {
+    if (!items.length) {
+      return {};
+    }
+    const since = dayjs().subtract(7, 'day').toDate();
+    const posts = await this._postRepository.getRecentChannelPosts(
+      orgId,
+      [...new Set(items.map((item) => item.integrationId))],
+      since,
+      excludePostId
+    );
+
+    const describe = (post: (typeof posts)[number]) =>
+      `post ${post.id} on channel ${post.integrationId} (${post.state}, ${dayjs(
+        post.publishDate
+      ).format('YYYY-MM-DD HH:mm')} UTC): "${this.approvalText(
+        post.content,
+        true
+      ).slice(0, 120)}"`;
+
+    const exact: typeof posts = [];
+    const near: typeof posts = [];
+    for (const item of items) {
+      const mine = this.approvalFingerprints(item);
+      for (const post of posts.filter(
+        (p) => p.integrationId === item.integrationId
+      )) {
+        const theirs = this.approvalFingerprints({
+          integrationId: post.integrationId,
+          content: post.content,
+          media: post.image,
+        });
+        if (theirs.exact === mine.exact && post.state !== 'ERROR') {
+          exact.push(post);
+        } else if (theirs.loose === mine.loose) {
+          near.push(post);
+        }
+      }
+    }
+
+    if (exact.length) {
+      const channels = [...new Set(exact.map((p) => p.integrationId))];
+      const others = [
+        ...new Set(
+          items
+            .map((item) => item.integrationId)
+            .filter((id) => !channels.includes(id))
+        ),
+      ];
+      return {
+        refuse: `This exact post already exists: ${exact
+          .map(describe)
+          .join('; ')}. Nothing was ${
+          phase === 'request' ? 'filed' : 'posted'
+        }${
+          others.length
+            ? `; channels not posted: ${others.join(', ')} (resend those alone)`
+            : ''
+        }.`,
+      };
+    }
+
+    if (!near.length) {
+      return {};
+    }
+    if (phase === 'request') {
+      return {
+        warn: `⚠ Resembles ${near.map(describe).join('; ')}. Approve only if this is a different post.`,
+        shown: near.map((p) => p.id),
+      };
+    }
+    const unseen = near.filter((p) => !shown.includes(p.id));
+    return unseen.length
+      ? {
+          refuse: `Not posted: it resembles ${unseen
+            .map(describe)
+            .join('; ')}, which the approver was not shown. Nothing was posted.`,
+        }
+      : {};
   }
 
   async getPosts(orgId: string, query: GetPostsDto) {

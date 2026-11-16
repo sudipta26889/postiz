@@ -11,6 +11,8 @@ const fakeRedis = () => {
   return {
     data,
     get: async (k: string) => data.get(k) ?? null,
+    // the lock release script: delete only if the token still matches
+    eval: async (_script: string, _n: number, k: string, token: string) => (data.get(k) === token ? (data.delete(k), 1) : 0),
     set: async (k: string, v: string, ...opts: any[]) => {
       if (opts.includes('NX') && data.has(k)) return null;
       data.set(k, v);
