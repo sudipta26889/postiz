@@ -7,6 +7,9 @@ type Ctx = {
   auth: any; // replace with your org type if you have it, e.g. Organization
   // a self-hosted connection: where its tool calls are relayed to
   relay?: SelfHostedInstance & { id: string };
+  // where the call came from: the approval gate (human.approval.ts) is skipped
+  // only for 'app' (the in-app chat), so an entry point that forgets it is gated
+  surface?: 'mcp' | 'app';
 };
 
 const als = new AsyncLocalStorage<Ctx>();

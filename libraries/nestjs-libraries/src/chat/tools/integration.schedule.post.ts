@@ -8,6 +8,7 @@ import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 import { AllProvidersSettings } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/all.providers.settings';
 import { Integration } from '@prisma/client';
 import { checkAuth } from '@gitroom/nestjs-libraries/chat/auth.context';
+import { publishNowReason } from '@gitroom/nestjs-libraries/chat/human.approval';
 import {
   ValidUrlExtension,
   ValidUrlPath,
@@ -58,6 +59,13 @@ const toMedia = (
         thumbnailTimestamp: a.thumbnailTimestamp,
       };
 
+// Any one item that publishes now gates the whole call; drafts never do.
+// The rule is shared with POST /public/v1/posts (human.approval.ts).
+export const scheduleApproval = (
+  inputData: { socialPost?: { type?: string; date?: string }[] },
+  now = Date.now()
+): string | null => publishNowReason(inputData?.socialPost, now);
+
 @Injectable()
 export class IntegrationSchedulePostTool implements AgentToolInterface {
   constructor(
@@ -65,6 +73,25 @@ export class IntegrationSchedulePostTool implements AgentToolInterface {
     private _integrationService: IntegrationService
   ) {}
   name = 'integrationSchedulePostTool';
+  approval = scheduleApproval;
+
+  // A human may have edited the approved args: every channel must still be
+  // one of this organization's (the rest of the checks run in execute)
+  async approvalValidate(
+    args: { socialPost: { integrationId: string }[] },
+    orgId: string
+  ) {
+    for (const p of args.socialPost) {
+      const integration = await this._integrationService.getIntegrationById(
+        orgId,
+        p.integrationId
+      );
+      if (!integration) {
+        return `Channel ${p.integrationId} was not found in this organization`;
+      }
+    }
+    return null;
+  }
 
   run() {
     return createTool({

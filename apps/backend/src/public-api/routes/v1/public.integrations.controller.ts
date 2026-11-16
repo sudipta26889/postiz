@@ -42,6 +42,8 @@ import { ClippingService } from '@gitroom/nestjs-libraries/database/prisma/clipp
 import { NotificationService } from '@gitroom/nestjs-libraries/database/prisma/notifications/notification.service';
 import { GetNotificationsDto } from '@gitroom/nestjs-libraries/dtos/notifications/get.notifications.dto';
 import * as Sentry from '@sentry/nestjs';
+import { publishNowReason } from '@gitroom/nestjs-libraries/chat/human.approval';
+import { publicApproval } from '@gitroom/nestjs-libraries/chat/public.approval';
 import {
   socialIntegrationList,
   IntegrationManager,
@@ -151,6 +153,24 @@ export class PublicIntegrationsController {
     @Body() rawBody: any
   ) {
     Sentry.metrics.count('public_api-request', 1);
+    // publishing now needs a human (DharaHIL); drafts and future dates don't
+    const reason = publishNowReason([
+      { type: rawBody?.type, date: rawBody?.date },
+    ]);
+    if (reason === null) {
+      return this.runCreatePost(org, rawBody);
+    }
+    return publicApproval.run({
+      action: 'public.posts.create',
+      org: org.id,
+      args: rawBody,
+      reason,
+      // an approved edit goes through every check below again
+      execute: (args) => this.runCreatePost(org, args),
+    });
+  }
+
+  private async runCreatePost(org: Organization, rawBody: any) {
     const body = await this._postsService.mapTypeToPost(
       {
         ...rawBody,
@@ -237,8 +257,17 @@ export class PublicIntegrationsController {
     @Param('id') id: string
   ) {
     Sentry.metrics.count('public_api-request', 1);
-    const getPostById = await this._postsService.getPost(org.id, id);
-    return this._postsService.deletePost(org.id, getPostById.group);
+    // deleting cannot be undone: a human approves it (DharaHIL)
+    return publicApproval.run({
+      action: 'public.posts.delete',
+      org: org.id,
+      args: { id },
+      reason: 'Deleting a post cannot be undone',
+      execute: async (args) => {
+        const getPostById = await this._postsService.getPost(org.id, args.id);
+        return this._postsService.deletePost(org.id, getPostById.group);
+      },
+    });
   }
 
   @Delete('/posts/group/:group')
@@ -247,7 +276,13 @@ export class PublicIntegrationsController {
     @Param('group') group: string
   ) {
     Sentry.metrics.count('public_api-request', 1);
-    return this._postsService.deletePost(org.id, group);
+    return publicApproval.run({
+      action: 'public.posts.deleteGroup',
+      org: org.id,
+      args: { group },
+      reason: 'Deleting a post group cannot be undone',
+      execute: (args) => this._postsService.deletePost(org.id, args.group),
+    });
   }
 
   @Get('/is-connected')

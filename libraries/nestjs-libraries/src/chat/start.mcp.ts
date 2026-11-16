@@ -393,7 +393,7 @@ export const startMcp = async (app: INestApplication) => {
 
     endListenStream(req, res);
     fixAcceptHeader(req);
-    await runWithContext({ requestId: token!, auth, relay: relay || undefined }, async () => {
+    await runWithContext({ requestId: token!, auth, relay: relay || undefined, surface: 'mcp' }, async () => {
       await (relay ? selfHostedServer! : mcpServer).startHTTP({
         url: url,
         httpPath: url.pathname,
@@ -443,7 +443,7 @@ export const startMcp = async (app: INestApplication) => {
     endListenStream(req, res);
     fixAcceptHeader(req);
     // @ts-ignore
-    await runWithContext({ requestId: token, auth: req.auth }, async () => {
+    await runWithContext({ requestId: token, auth: req.auth, surface: 'mcp' }, async () => {
       await server.startHTTP({
         url,
         httpPath: url.pathname,
@@ -485,7 +485,7 @@ export const startMcp = async (app: INestApplication) => {
     fixAcceptHeader(req);
     await runWithContext(
       // @ts-ignore
-      { requestId: req.params.id, auth: req.auth },
+      { requestId: req.params.id, auth: req.auth, surface: 'mcp' },
       async () => {
         await server.startHTTP({
           url,
@@ -524,7 +524,7 @@ export const startMcp = async (app: INestApplication) => {
 
     await runWithContext(
       // @ts-ignore
-      { requestId: req.params.id, auth: req.auth },
+      { requestId: req.params.id, auth: req.auth, surface: 'mcp' },
       async () => {
         await new MCPServer(serverConfig).startSSE({
           url,

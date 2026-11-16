@@ -8,6 +8,7 @@ import { ModuleRef } from '@nestjs/core';
 import { toolList } from '@gitroom/nestjs-libraries/chat/tools/tool.list';
 import { AgentToolInterface } from '@gitroom/nestjs-libraries/chat/agent.tool.interface';
 import dayjs from 'dayjs';
+import { mcpApproval } from '@gitroom/nestjs-libraries/chat/mcp.approval';
 
 export const AgentState = object({
   proverbs: array(string()).default([]),
@@ -34,7 +35,7 @@ export class LoadToolsService {
           .filter((p) => !p.available || p.available())
           .map(async (p) => ({
             name: p.name as string,
-            tool: await p.run(),
+            tool: this.gate(p, await p.run()),
           }))
       )
     ).reduce(
@@ -44,6 +45,50 @@ export class LoadToolsService {
       }),
       {} as Record<string, any>
     );
+  }
+
+  // A tool that declares `approval` asks a human (DharaHIL) over MCP, whatever
+  // it does; the checks the schema makes run before a human is bothered, and
+  // again on args a human edited
+  private gate(p: AgentToolInterface, tool: any) {
+    if (!p.approval) {
+      return tool;
+    }
+    const check = async (args: any) => {
+      const result = await tool.inputSchema?.['~standard']?.validate(args);
+      return result?.issues
+        ? result.issues.map((i: any) => i.message).join('; ')
+        : null;
+    };
+    const gated = mcpApproval.withApproval({
+      toolName: p.name,
+      approval: (args) => p.approval!(args),
+      // args a human edited are refused when the schema can't check them
+      validate: async (args, orgId) =>
+        (!tool.inputSchema?.['~standard']?.validate
+          ? 'the arguments cannot be validated'
+          : await check(args)) ||
+        (p.approvalValidate ? p.approvalValidate(args, orgId) : null),
+      execute: tool.execute,
+    });
+    tool.execute = async (inputData: any, context: any) => {
+      const problem = await check(inputData);
+      if (problem) {
+        throw new Error(`Invalid arguments: ${problem}`);
+      }
+      return gated(inputData, context);
+    };
+    return tool;
+  }
+
+  // Names of the tools a human has to approve; the relay refuses them
+  gatedToolNames() {
+    return toolList
+      .map(
+        (p) => this._moduleRef.get(p, { strict: false }) as AgentToolInterface
+      )
+      .filter((p) => !!p.approval)
+      .map((p) => p.name);
   }
 
   // Tools a self-hosted instance must have to connect through the relay

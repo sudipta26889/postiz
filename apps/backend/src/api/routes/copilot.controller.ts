@@ -20,6 +20,7 @@ import { MastraAgent } from '@ag-ui/mastra';
 import { MastraService } from '@gitroom/nestjs-libraries/chat/mastra.service';
 import { Request, Response } from 'express';
 import { RequestContext } from '@mastra/core/di';
+import { runWithContext } from '@gitroom/nestjs-libraries/chat/async.storage';
 import { CheckPolicies } from '@gitroom/backend/services/auth/permissions/permissions.ability';
 import { AuthorizationActions, Sections } from '@gitroom/backend/services/auth/permissions/permission.exception.class';
 
@@ -110,7 +111,13 @@ export class CopilotController {
       }),
     });
 
-    return copilotRuntimeHandler(req, res);
+    // the in-app chat is the only surface the approval gate trusts
+    await runWithContext(
+      { requestId: organization.id, auth: undefined, surface: 'app' },
+      async () => {
+        await copilotRuntimeHandler(req, res);
+      }
+    );
   }
 
   @Get('/credits')

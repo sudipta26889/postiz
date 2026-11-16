@@ -185,6 +185,38 @@ publish-now is refused, which changes behaviour for the key-based agents that us
 - Fail closed: no config gives an error, and an undefined surface is gated.
 - Dev-instance run-through: delete → waiting → approve → deleted → call again → "already done".
 
+## Phase G2: the same gate on the public REST API (ships in the same PR as G)
+
+Gap: the org API key (and `pos_` tokens, `public.auth.middleware.ts:32-38`) also works on the public API
+(`apps/backend/src/public-api/routes/v1/public.integrations.controller.ts`). Without a gate there, the MCP-only gate
+is bypassed by calling REST. The grihatek agents post through a Paperclip "postiz-api-key-shim" over this API.
+
+Gated routes (owner's scope: delete and publish-now):
+- `POST /public/v1/posts` (`:147`) when any post is `type: "now"`, or dated at or before now + 5 min, or has an
+  unparseable date. The trigger rule is the one from Phase G, shared.
+- `DELETE /public/v1/posts/:id` (`:234`) and `DELETE /public/v1/posts/group/:group` (`:244`).
+
+How: the same `human.approval.ts` helper, called from the controller (or its service) with a generic action name
+(`public.posts.create`, `public.posts.delete`, `public.posts.deleteGroup`) and the request body/params as args.
+Same key, Redis map, claim and fail-closed rules.
+
+HTTP answers. A pending approval must never look like success to a REST client:
+- Pending → **HTTP 428 Precondition Required**, JSON `{ status: "approval_pending", requestId, expiresAt,
+  message: "Repeat the identical request after approval in DharaHIL" }`.
+- Rejected, expired, denied or misconfigured → **403** with the reason.
+- `done` claim on a repeat → **409** "already done (request <id>)". `running` → **409** with the "result unknown" text.
+- Approved and first claim → the normal success response.
+
+Not gated: the frontend's own `/posts` routes (a signed-in person, same as the in-app chat), future scheduling,
+drafts, edits, reads. Deleting a channel (`DELETE /public/v1/integrations/:id`, `:583`) is outside the owner's
+scope as stated; it's listed for the owner to decide.
+
+Effect on the grihatek agents: they get Paperclip's approval **and then** DharaHIL's. Their shim must treat 428 as
+"wait and retry", not as a failure. The Paperclip owner must be told before release (through Guardian).
+
+Checks (jest): each gated route returns 428 on first call, the success response after approval, 409 on repeat;
+ungated cases (a future date, drafts) pass straight through; no config or no Redis → 403.
+
 ## Phase H1: hardening with no schema change (revised)
 
 | Gap | Change |

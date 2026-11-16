@@ -196,6 +196,8 @@ export class McpRelayService {
   // run by the instance. Pass tools without ui:// widgets - those upload to
   // this server - and _meta (a tool's widget link) is dropped too
   tools(source: Record<string, any>) {
+    // a human approves these (DharaHIL), which a relayed call cannot ask for
+    const gated = this._loadToolsService.gatedToolNames();
     return Object.fromEntries(
       Object.entries(source).map(([name, tool]) => [
         name,
@@ -206,6 +208,9 @@ export class McpRelayService {
           outputSchema: tool.outputSchema,
           mcp: { annotations: tool.mcp?.annotations },
           execute: async (inputData: Record<string, unknown>, context: any) => {
+            if (gated.includes(name)) {
+              return this.failure(tool, `${name} is not available through the relay`);
+            }
             const instance = getRelay();
             if (!instance) {
               throw new Error(
