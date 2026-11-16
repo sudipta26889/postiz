@@ -637,12 +637,37 @@ export class PostsService {
     if (!items.length) {
       return {};
     }
+
+    // An "edit" may only touch this org's drafts or queued posts: editing a
+    // published or failed post would queue it and post it again. Only those
+    // checked ids are left out of the duplicate search
+    let exclude: string[] = [];
+    if (excludePostIds.length) {
+      const found = await this._postRepository.getPostStates(
+        orgId,
+        excludePostIds
+      );
+      const refused = found.filter(
+        (p) => p.state !== 'DRAFT' && p.state !== 'QUEUE'
+      );
+      if (refused.length) {
+        return {
+          refuse: `This edits ${refused
+            .map((p) => `post ${p.id} (${p.state})`)
+            .join(', ')}, which already went out or failed; editing it would post it again. Nothing was ${
+            phase === 'request' ? 'filed' : 'posted'
+          }.`,
+        };
+      }
+      exclude = found.map((p) => p.id);
+    }
+
     const since = dayjs().subtract(7, 'day').toDate();
     const posts = await this._postRepository.getRecentChannelPosts(
       orgId,
       [...new Set(items.map((item) => item.integrationId))],
       since,
-      excludePostIds
+      exclude
     );
 
     const describe = (post: (typeof posts)[number]) =>

@@ -19,7 +19,9 @@ export const createPublicApproval = (gate = approvalGate) => ({
     const decision = await gate.decide<T>({
       ...input,
       releaseOnError: (err) =>
-        err instanceof HttpException && err.getStatus() === 404,
+        err instanceof HttpException &&
+        (err.getStatus() === 404 ||
+          (err.getResponse() as any)?.nothingDone === true),
     });
 
     switch (decision.status) {

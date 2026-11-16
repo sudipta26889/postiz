@@ -245,7 +245,12 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
   // refused (an ACL, a misconfigured server), the gate says so and refuses
   // gated actions with 503 instead of failing silently later
   let broken: string | undefined;
-  const selfTest = async () => {
+  let ready: Promise<string | undefined> | undefined;
+  const selfTest = () => {
+    ready = runSelfTest();
+    return ready;
+  };
+  const runSelfTest = async () => {
     const probe = `hil:probe:${crypto.randomBytes(6).toString('hex')}`;
     const token = crypto.randomBytes(8).toString('hex');
     try {
@@ -277,22 +282,29 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
   let notifier:
     | ((org: string, subject: string, message: string) => Promise<unknown>)
     | undefined;
+  // once per request and outcome; a failed send frees the flag so the next
+  // pass tries again
   const notifyOnce = async (
     requestId: string,
     org: string,
     subject: string,
-    message: string
+    message: string,
+    outcome: string
   ) => {
     if (!notifier) {
       return;
     }
+    const flag = `hil:notified:${requestId}:${outcome}`;
+    let claimed = false;
     try {
-      if (
-        await deps.redis.set(`hil:notified:${requestId}`, '1', 'EX', approvedTtl, 'NX')
-      ) {
+      claimed = !!(await deps.redis.set(flag, '1', 'EX', approvedTtl, 'NX'));
+      if (claimed) {
         await notifier(org, subject, message);
       }
     } catch (err: any) {
+      if (claimed) {
+        await deps.redis.del(flag).catch(() => undefined);
+      }
       console.error(`[approval] could not notify about ${requestId}`, err?.message);
     }
   };
@@ -388,7 +400,7 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       }
       const verdict = await input.guard.check(args, input.org, 'execute', shown);
       if (verdict.refuse) {
-        await notApproved(cfg, requestId, version, input.org, verdict.refuse);
+        await notApproved(cfg, requestId, version, input.org, verdict.refuse, 'duplicate');
         await forgetPending(requestId);
         return { status: 'refused', duplicate: true, message: verdict.refuse };
       }
@@ -422,7 +434,8 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     requestId: string,
     version: number,
     org: string,
-    reason: string
+    reason: string,
+    outcome = 'not-carried-out'
   ) => {
     await reportNotExecuted(cfg, requestId, version, reason);
     const stored = await pendingItem(requestId);
@@ -430,7 +443,8 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       requestId,
       org,
       'An approved agent action was not carried out',
-      `Request ${requestId}${stored?.reason ? ` (${stored.reason.slice(0, 300)})` : ''} was approved but not carried out: ${reason}`
+      `Request ${requestId}${stored?.reason ? ` (${stored.reason.slice(0, 300)})` : ''} was approved but not carried out: ${reason}`,
+      outcome
     );
   };
 
@@ -486,7 +500,8 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
         input.org,
         nothingDone
           ? `it failed and nothing was done (${err?.message || err})`
-          : `it failed part-way (${err?.message || err}); the outcome is unknown, check before retrying`
+          : `it failed part-way (${err?.message || err}); the outcome is unknown, check before retrying`,
+        nothingDone ? 'failed-nothing-done' : 'failed-unknown'
       );
       throw err;
     }
@@ -500,7 +515,8 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
         input.org,
         `nothing was done: ${String(
           (result as any)?.output?.errors ?? 'the action refused the arguments'
-        ).slice(0, 300)}`
+        ).slice(0, 300)}`,
+        'no-op'
       );
       return { status: 'executed', result };
     }
@@ -560,7 +576,8 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
           requestId,
           input.org,
           'An agent request expired without approval',
-          `${outcome}${stored?.reason ? ` It was: ${stored.reason.slice(0, 300)}` : ''}`
+          `${outcome}${stored?.reason ? ` It was: ${stored.reason.slice(0, 300)}` : ''}`,
+          'expired'
         );
       }
       // the sweep keeps the mapping so the agent's next identical call learns
@@ -577,18 +594,16 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
 
     // a human must have made the decision (not a rule or a standing grant)
     if (!data.last_decision_by?.email) {
-      return {
-        status: 'refused',
-        message: `Approval request ${requestId} was not approved by a named person`,
-      };
+      const message = `Approval request ${requestId} was not approved by a named person`;
+      await notApproved(cfg, requestId, data.version ?? 1, input.org, message, 'no-person');
+      return { status: 'refused', message };
     }
 
     // the GET has no tool_name: the metadata we set ties it to this call
     if (data.metadata?.org !== input.org || data.metadata?.tool !== input.action) {
-      return {
-        status: 'refused',
-        message: `Approval request ${requestId} does not match this organization or action`,
-      };
+      const message = `Approval request ${requestId} does not match this organization or action`;
+      await notApproved(cfg, requestId, data.version ?? 1, input.org, message, 'mismatch');
+      return { status: 'refused', message };
     }
 
     await deps.redis.expire(reqKey(key), approvedTtl);
@@ -600,10 +615,9 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     if (input.validate) {
       const problem = await input.validate(args, input.org);
       if (problem) {
-        return {
-          status: 'refused',
-          message: `The approved arguments were refused: ${problem}`,
-        };
+        const message = `The approved arguments were refused: ${problem}`;
+        await notApproved(cfg, requestId, data.version ?? 1, input.org, message, 'invalid-args');
+        return { status: 'refused', message };
       }
     }
 
@@ -781,6 +795,10 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
           'Approval needs Redis (REDIS_URL is not set), this action is refused',
       };
     }
+    // the start-up self-test finishes before the first decision
+    if (ready) {
+      await ready;
+    }
     if (broken) {
       return { status: 'refused', unavailable: true, message: broken };
     }
@@ -814,9 +832,13 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       !cfg.tenantId ||
       !cfg.appId ||
       !cfg.apiKey ||
-      !deps.hasRedis() ||
-      broken
+      !deps.hasRedis()
     ) {
+      return;
+    }
+    // a refused Redis operation (an ACL) may have been fixed since: test again
+    // rather than staying broken until a restart
+    if (broken && (await selfTest())) {
       return;
     }
 
@@ -857,6 +879,15 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
           guard: executor.guard,
           execute: (args) => executor.execute(item.org, args),
         }, 'sweep');
+        if (decision.status === 'running') {
+          await notifyOnce(
+            requestId,
+            item.org,
+            'An approved agent action may not have finished',
+            decision.message,
+            'running'
+          );
+        }
         if (decision.status !== 'pending') {
           await forget(requestId);
           if (decision.status === 'refused') {

@@ -860,6 +860,8 @@ export class PublicIntegrationsController implements OnModuleInit {
       throw new HttpException(
         {
           msg: 'The post changed after it was approved; send the request again to ask for a new approval',
+          // checked before anything is written: nothing was done
+          nothingDone: true,
         },
         409
       );

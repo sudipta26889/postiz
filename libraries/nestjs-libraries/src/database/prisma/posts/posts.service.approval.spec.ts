@@ -30,11 +30,14 @@ const { PostsService } = require('@gitroom/nestjs-libraries/database/prisma/post
 
 // PostsService has many collaborators; the duplicate decision only needs the
 // repository read, so it is tested on a bare instance
-const serviceWith = (posts: any[]) => {
+const serviceWith = (posts: any[], states: { id: string; state: string }[] = []) => {
   const service = Object.create(PostsService.prototype);
   const getRecentChannelPosts = jest.fn(async () => posts);
-  (service as any)._postRepository = { getRecentChannelPosts };
-  return { service, getRecentChannelPosts };
+  const getPostStates = jest.fn(async (_org: string, ids: string[]) =>
+    states.filter((p) => ids.includes(p.id))
+  );
+  (service as any)._postRepository = { getRecentChannelPosts, getPostStates };
+  return { service, getRecentChannelPosts, getPostStates };
 };
 
 const stored = (extra: any = {}) => ({
@@ -125,13 +128,13 @@ describe('approval duplicate decision (PostsService, G4 v3)', () => {
   });
 
   it('looks only at this org and these channels, excluding the draft itself', async () => {
-    const { service, getRecentChannelPosts } = serviceWith([]);
-    await service.approvalDuplicateCheck('org1', [item()], 'execute', [], 'draft-1');
+    const { service, getRecentChannelPosts } = serviceWith([], [{ id: 'draft-1', state: 'DRAFT' }]);
+    await service.approvalDuplicateCheck('org1', [item()], 'execute', [], ['draft-1']);
     expect(getRecentChannelPosts).toHaveBeenCalledWith(
       'org1',
       ['chan-1'],
       expect.any(Date),
-      'draft-1'
+      ['draft-1']
     );
   });
 
@@ -156,10 +159,26 @@ describe('approval duplicate decision (PostsService, G4 v3)', () => {
     expect(verdict.refuse).not.toMatch(/chan-1 Monday \(resend/);
   });
 
-  it('does not count a post as a copy of itself when it is being edited', async () => {
-    const { service, getRecentChannelPosts } = serviceWith([]);
+  it('does not count a queued post as a copy of itself when it is being edited', async () => {
+    const { service, getRecentChannelPosts } = serviceWith([], [{ id: 'p-old', state: 'QUEUE' }]);
     await service.approvalDuplicateCheck('org1', [item()], 'request', [], ['p-old']);
     expect(getRecentChannelPosts).toHaveBeenCalledWith('org1', ['chan-1'], expect.any(Date), ['p-old']);
+  });
+
+  it('refuses an "edit" of a post that already went out or failed (it would post again)', async () => {
+    for (const state of ['PUBLISHED', 'ERROR']) {
+      const { service, getRecentChannelPosts } = serviceWith([stored({ state })], [{ id: 'p-old', state }]);
+      const verdict = await service.approvalDuplicateCheck('org1', [item()], 'execute', [], ['p-old']);
+      expect(verdict.refuse).toMatch(new RegExp(`edits post p-old \\(${state}\\).*would post it again`));
+      expect(getRecentChannelPosts).not.toHaveBeenCalled();
+    }
+  });
+
+  it('never excludes an id from another organization (not found = not excluded)', async () => {
+    const { service, getRecentChannelPosts } = serviceWith([stored()], []);
+    const verdict = await service.approvalDuplicateCheck('org1', [item()], 'execute', [], ['p-old']);
+    expect(getRecentChannelPosts).toHaveBeenCalledWith('org1', ['chan-1'], expect.any(Date), []);
+    expect(verdict.refuse).toMatch(/This exact post already exists/);
   });
 
   it('schedules only a draft: a queued or published post gives no items to approve', async () => {

@@ -501,6 +501,51 @@ describe('duplicate guard (G4 v3)', () => {
     expect(second.context_summary).toMatch(/^⚠ Possible duplicate of pending request req1/);
   });
 
+  it('reports and notifies an approval with no named person instead of dropping it', async () => {
+    const { gate, reportedNotExecuted } = guardedSetup([
+      created,
+      json({ status: 'APPROVED', version: 2, metadata: { org: 'org1', tool: 'public.posts.create' } }),
+      json({}),
+    ]);
+    const notify = jest.fn(async () => undefined);
+    gate.registerNotifier(notify);
+    gate.registerExecutor('public.posts.create', { execute: jest.fn(), guard: guard() });
+    await gate.decide(postInput(guard()));
+    await gate.sweep();
+    expect(reportedNotExecuted()).toHaveLength(1);
+    expect(notify.mock.calls[0][2]).toMatch(/not approved by a named person/);
+  });
+
+  it('tells the organization when the sweep finds a run whose outcome is unknown', async () => {
+    const { gate, data } = guardedSetup([created, approvedPost()]);
+    const notify = jest.fn(async () => undefined);
+    gate.registerNotifier(notify);
+    gate.registerExecutor('public.posts.create', { execute: jest.fn(), guard: guard() });
+    await gate.decide(postInput(guard()));
+    data.set('hil:exec:req1', 'running');
+    await gate.sweep();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][1]).toMatch(/may not have finished/);
+  });
+
+  it('notifies each distinct outcome once, and retries a notification that failed to send', async () => {
+    const { gate } = guardedSetup([created, json({ status: 'EXPIRED' }), json({ status: 'EXPIRED' })]);
+    const notify = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('mail down'))
+      .mockResolvedValue(undefined);
+    gate.registerNotifier(notify);
+    const error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    gate.registerExecutor('public.posts.create', { execute: jest.fn(), guard: guard() });
+    await gate.decide(postInput(guard()));
+    // first send fails: the item stays known through the agent mapping, and
+    // the next report of the same outcome sends it
+    await gate.sweep();
+    await gate.decide(postInput(guard()));
+    expect(notify).toHaveBeenCalledTimes(2);
+    error.mockRestore();
+  });
+
   it('decides with what the approver was shown, and runs the args they saw', async () => {
     const { gate } = guardedSetup([created, approvedPost(), json({})]);
     const run = jest.fn(async () => 'posted');
@@ -542,6 +587,29 @@ describe('Redis self-test (no silent failure)', () => {
         : 1
     );
     expect(await gate.selfTest()).toBeUndefined();
+  });
+
+  it('re-tests on the next sweep and recovers once Redis allows the command again', async () => {
+    let allowed = false;
+    const gate = gateWith((data: Map<string, string>) => async (script: string, _n: number, k: string, arg: string) => {
+      if (!allowed) throw new Error('NOPERM eval');
+      return script.includes('ARGV[1] then return redis.call')
+        ? data.get(k) === arg ? (data.delete(k), 1) : 0
+        : 1;
+    });
+    const error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    expect(await gate.selfTest()).toMatch(/approval queue unavailable/);
+    allowed = true;
+    await gate.sweep();
+    const decision = await gate.decide({
+      action: 'deletePostTool',
+      org: 'org1',
+      args: { id: 'p1' },
+      reason: 'Deleting a post',
+      execute: jest.fn(),
+    });
+    expect((decision as any).message ?? '').not.toMatch(/approval queue unavailable/);
+    error.mockRestore();
   });
 
   it('when Redis refuses a command, says why and refuses gated actions (503), never silently', async () => {

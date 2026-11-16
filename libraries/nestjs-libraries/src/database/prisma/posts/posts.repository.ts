@@ -1281,6 +1281,14 @@ export class PostsRepository {
     });
   }
 
+  // The state of posts a request says it edits (this org only)
+  getPostStates(orgId: string, ids: string[]) {
+    return this._post.model.post.findMany({
+      where: { organizationId: orgId, id: { in: ids }, deletedAt: null },
+      select: { id: true, state: true },
+    });
+  }
+
   // The posts an approved agent post could duplicate: live main posts on
   // these channels, queued, or published/failed in the last week
   getRecentChannelPosts(
