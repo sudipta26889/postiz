@@ -70,6 +70,14 @@ export interface DecideInput<T> {
   releaseOnError?: (err: unknown) => boolean;
 }
 
+// How Postiz carries out an approved action on its own (no agent retry):
+// each caller registers, per action name, how to run it for an organization
+export interface ApprovalExecutor {
+  execute: (orgId: string, args: any) => Promise<any>;
+  validate?: (args: any, orgId: string) => Promise<string | null> | string | null;
+  isNoop?: (result: any) => boolean;
+}
+
 // Canonical JSON: sorted keys, like the DharaHIL SDK
 export const canonicalJson = (value: any): string => {
   if (Array.isArray(value)) {
@@ -153,6 +161,10 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
   };
 
   const reqKey = (key: string) => `hil:req:${key}`;
+  // a pending approval Postiz will carry out itself once a person approves
+  const pendingKey = (requestId: string) => `hil:pending:${requestId}`;
+  const pendingSet = 'hil:pending';
+  const executors = new Map<string, ApprovalExecutor>();
   const execKey = (requestId: string) => `hil:exec:${requestId}`;
 
   const ttlUntil = (expiresAt: string) =>
@@ -247,7 +259,7 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     if (data.status === 'PENDING') {
       return pending(
         requestId,
-        `Still waiting for human approval in DharaHIL (request ${requestId}).`
+        `Still waiting for human approval in DharaHIL (request ${requestId}). Postiz carries it out automatically once approved.`
       );
     }
 
@@ -352,9 +364,22 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       ttlUntil(created.expires_at)
     );
     if (created.status === 'PENDING') {
+      // remembered so Postiz runs it itself the moment a person approves
+      await deps.redis.set(
+        pendingKey(created.request_id),
+        JSON.stringify({
+          action: input.action,
+          org: input.org,
+          args: input.args,
+          key,
+        }),
+        'EX',
+        ttlUntil(created.expires_at) + approvedTtl
+      );
+      await deps.redis.sadd(pendingSet, created.request_id);
       return pending(
         created.request_id,
-        `Waiting for human approval in DharaHIL (request ${created.request_id}, expires ${created.expires_at}). Repeat the identical call once approved.`,
+        `Approval requested in DharaHIL (request ${created.request_id}, expires ${created.expires_at}). Once a person approves, Postiz carries it out automatically: do not retry or change the request. Calling again with the same arguments only reports its status.`,
         created.expires_at
       );
     }
@@ -397,7 +422,90 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     }
   };
 
-  return { decide };
+  const registerExecutor = (action: string, executor: ApprovalExecutor) => {
+    executors.set(action, executor);
+  };
+
+  // Carry out every pending action a person has approved since the last
+  // sweep, through the same checks and at-most-once claim as a repeated
+  // call, so an agent never has to resend an identical request
+  const sweep = async () => {
+    const cfg = deps.config();
+    if (
+      !cfg.baseUrl ||
+      !cfg.tenantId ||
+      !cfg.appId ||
+      !cfg.apiKey ||
+      !deps.hasRedis()
+    ) {
+      return;
+    }
+
+    const forget = async (requestId: string) => {
+      await deps.redis.srem(pendingSet, requestId);
+      await deps.redis.del(pendingKey(requestId));
+    };
+
+    for (const requestId of await deps.redis.smembers(pendingSet)) {
+      const raw = await deps.redis.get(pendingKey(requestId));
+      if (!raw) {
+        await deps.redis.srem(pendingSet, requestId);
+        continue;
+      }
+      const item = JSON.parse(raw);
+      const executor = executors.get(item.action);
+      if (!executor) {
+        continue;
+      }
+
+      try {
+        const decision = await read(cfg, item.key, requestId, {
+          action: item.action,
+          org: item.org,
+          args: item.args,
+          reason: '',
+          validate: executor.validate,
+          isNoop: executor.isNoop,
+          execute: (args) => executor.execute(item.org, args),
+        });
+        if (decision.status !== 'pending') {
+          await forget(requestId);
+          if (decision.status === 'refused') {
+            console.error(`[approval] ${requestId} not carried out: ${decision.message}`);
+          }
+        }
+      } catch (err: any) {
+        // the approval service failing is transient: try again next sweep;
+        // the action itself failing is not retried (its claim stays)
+        if (!(err instanceof ApprovalError)) {
+          await forget(requestId);
+        }
+        console.error(`[approval] ${requestId} sweep failed`, err?.message);
+      }
+    }
+  };
+
+  return { decide, registerExecutor, sweep };
 };
 
 export const approvalGate = createApprovalGate();
+
+// Runs the sweep every 30 s in the backend; one sweep at a time
+export const startApprovalSweep = (gate = approvalGate, everyMs = 30000) => {
+  let running = false;
+  const timer = setInterval(async () => {
+    if (running) {
+      return;
+    }
+    running = true;
+    try {
+      await gate.sweep();
+    } catch (err: any) {
+      console.error('[approval] sweep error', err?.message);
+    } finally {
+      running = false;
+    }
+  }, everyMs);
+  timer.unref?.();
+  return timer;
+};

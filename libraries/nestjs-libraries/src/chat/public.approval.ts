@@ -28,7 +28,8 @@ export const createPublicApproval = (gate = approvalGate) => ({
             status: 'approval_pending',
             requestId: decision.requestId,
             expiresAt: decision.expiresAt,
-            message: 'Repeat the identical request after approval in DharaHIL',
+            message:
+              'Postiz carries it out automatically once a person approves in DharaHIL; repeating the identical request only reports its status',
           },
           428
         );

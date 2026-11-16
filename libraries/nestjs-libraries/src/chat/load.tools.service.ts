@@ -9,6 +9,10 @@ import { toolList } from '@gitroom/nestjs-libraries/chat/tools/tool.list';
 import { AgentToolInterface } from '@gitroom/nestjs-libraries/chat/agent.tool.interface';
 import dayjs from 'dayjs';
 import { mcpApproval } from '@gitroom/nestjs-libraries/chat/mcp.approval';
+import { approvalGate } from '@gitroom/nestjs-libraries/chat/human.approval';
+import { runWithContext } from '@gitroom/nestjs-libraries/chat/async.storage';
+import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.service';
+import { RequestContext } from '@mastra/core/di';
 
 export const AgentState = object({
   proverbs: array(string()).default([]),
@@ -60,16 +64,44 @@ export class LoadToolsService {
         ? result.issues.map((i: any) => i.message).join('; ')
         : null;
     };
+    // args a human edited are refused when the schema can't check them
+    const validate = async (args: any, orgId: string) =>
+      (!tool.inputSchema?.['~standard']?.validate
+        ? 'the arguments cannot be validated'
+        : await check(args)) ||
+      (p.approvalValidate ? p.approvalValidate(args, orgId) : null);
+    // a tool answering with errors did nothing: the claim is released
+    const isNoop = (result: any) => !!result?.output?.errors;
+    const execute = tool.execute;
+
     const gated = mcpApproval.withApproval({
       toolName: p.name,
       approval: (args, orgId) => p.approval!(args, orgId),
-      // args a human edited are refused when the schema can't check them
-      validate: async (args, orgId) =>
-        (!tool.inputSchema?.['~standard']?.validate
-          ? 'the arguments cannot be validated'
-          : await check(args)) ||
-        (p.approvalValidate ? p.approvalValidate(args, orgId) : null),
-      execute: tool.execute,
+      validate,
+      execute,
+    });
+
+    // Once a person approves, Postiz runs the tool itself (approval sweep),
+    // as the organization that asked, with the same context an MCP call has
+    approvalGate.registerExecutor(p.name, {
+      validate,
+      isNoop,
+      execute: async (orgId, args) => {
+        const org = await this._moduleRef
+          .get(OrganizationService, { strict: false })
+          .getOrgByIdWithSubscription(orgId);
+        if (!org || org.deletedAt) {
+          throw new Error(`Organization ${orgId} not found`);
+        }
+        return runWithContext(
+          { requestId: `approval:${p.name}`, auth: org, surface: 'mcp' },
+          () =>
+            execute(args, {
+              mcp: { extra: { authInfo: org } },
+              requestContext: new RequestContext(),
+            })
+        );
+      },
     });
     tool.execute = async (inputData: any, context: any) => {
       const problem = await check(inputData);

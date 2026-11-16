@@ -26,6 +26,10 @@ const setup = (answers: any[], hasRedis = true) => {
       },
       del: async (k: string) => (data.delete(k) ? 1 : 0),
       expire: async () => 1,
+      // sets (the pending approvals the sweep carries out)
+      sadd: async (k: string, v: string) => { const set = new Set(JSON.parse((globalThis as any).__sets?.[k] ?? '[]')); set.add(v); ((globalThis as any).__sets ??= {})[k] = JSON.stringify([...set]); return 1; },
+      srem: async (k: string, v: string) => { const set = new Set(JSON.parse((globalThis as any).__sets?.[k] ?? '[]')); set.delete(v); ((globalThis as any).__sets ??= {})[k] = JSON.stringify([...set]); return 1; },
+      smembers: async (k: string) => JSON.parse((globalThis as any).__sets?.[k] ?? '[]'),
     } as any,
     hasRedis: () => hasRedis,
     config: () => ({ baseUrl: 'https://hil', tenantId: 't', appId: 'a', apiKey: 'k' }),
@@ -161,5 +165,84 @@ describe('publishReason (shared trigger rule)', () => {
 
   it('lets only drafts through', () => {
     expect(publishReason([{ type: 'draft' }, { type: 'draft' }])).toBeNull();
+  });
+});
+
+describe('sweep: Postiz carries out an approved action itself', () => {
+  beforeEach(() => {
+    (globalThis as any).__sets = {};
+  });
+
+  const executor = () => {
+    const run = jest.fn(async (_org: string, args: any) => ({ deleted: args.id }));
+    return { run, executor: { execute: run } };
+  };
+
+  it('runs it once a person approves, with the approved args, without any agent retry', async () => {
+    const { gate } = setup([created, approved, json({})]);
+    const { run, executor: ex } = executor();
+    gate.registerExecutor('public.posts.delete', ex);
+    const neverCalled = jest.fn();
+
+    expect((await gate.decide(input(neverCalled))).status).toBe('pending');
+    await gate.sweep();
+
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run).toHaveBeenCalledWith('org1', { id: 'p1' });
+    expect(neverCalled).not.toHaveBeenCalled();
+
+    // nothing left to sweep
+    await gate.sweep();
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps waiting while the request is still pending', async () => {
+    const { gate } = setup([created, json({ status: 'PENDING' })]);
+    const { run, executor: ex } = executor();
+    gate.registerExecutor('public.posts.delete', ex);
+    await gate.decide(input(jest.fn()));
+    await gate.sweep();
+    expect(run).not.toHaveBeenCalled();
+    expect(JSON.parse((globalThis as any).__sets['hil:pending'])).toEqual(['req1']);
+  });
+
+  it('drops a rejected request without running it', async () => {
+    const { gate } = setup([created, json({ status: 'REJECTED' })]);
+    const { run, executor: ex } = executor();
+    gate.registerExecutor('public.posts.delete', ex);
+    await gate.decide(input(jest.fn()));
+    await gate.sweep();
+    expect(run).not.toHaveBeenCalled();
+    expect(JSON.parse((globalThis as any).__sets['hil:pending'])).toEqual([]);
+  });
+
+  it('never runs an approval twice: an agent repeating the call afterwards gets "already done"', async () => {
+    const { gate } = setup([created, approved, json({}), approved]);
+    const { run, executor: ex } = executor();
+    gate.registerExecutor('public.posts.delete', ex);
+    const agentExecute = jest.fn();
+    await gate.decide(input(agentExecute));
+    await gate.sweep();
+    const again = await gate.decide(input(agentExecute));
+    expect(again.status).toBe('done');
+    expect(agentExecute).not.toHaveBeenCalled();
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses an approval with no named person, even in the sweep', async () => {
+    const { gate } = setup([
+      created,
+      json({ status: 'APPROVED', version: 2, metadata: { org: 'org1', tool: 'public.posts.delete' } }),
+    ]);
+    const { run, executor: ex } = executor();
+    gate.registerExecutor('public.posts.delete', ex);
+    await gate.decide(input(jest.fn()));
+    await gate.sweep();
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('does nothing without config or Redis', async () => {
+    const { gate } = setup([], false);
+    await expect(gate.sweep()).resolves.toBeUndefined();
   });
 });

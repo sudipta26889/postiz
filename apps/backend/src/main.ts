@@ -19,6 +19,7 @@ import { PostValidationExceptionFilter } from '@gitroom/backend/api/routes/posts
 import { HttpExceptionFilter } from '@gitroom/nestjs-libraries/services/exception.filter';
 import { ConfigurationChecker } from '@gitroom/helpers/configuration/configuration.checker';
 import { startMcp } from '@gitroom/nestjs-libraries/chat/start.mcp';
+import { startApprovalSweep } from '@gitroom/nestjs-libraries/chat/human.approval';
 
 async function start() {
   const app = await NestFactory.create(AppModule, {
@@ -60,6 +61,8 @@ async function start() {
   });
 
   await startMcp(app);
+  // carry out actions a person approved in DharaHIL (no agent retry needed)
+  startApprovalSweep();
 
   app.useGlobalPipes(
     new ValidationPipe({

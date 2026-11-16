@@ -25,6 +25,10 @@ const setup = (answers: any[], hasRedis = true, configured = true) => {
         },
         del: async (k: string) => (data.delete(k) ? 1 : 0),
         expire: async () => 1,
+        // sets (the pending approvals the sweep carries out)
+        sadd: async (k: string, v: string) => { const set = new Set(JSON.parse((globalThis as any).__sets?.[k] ?? '[]')); set.add(v); ((globalThis as any).__sets ??= {})[k] = JSON.stringify([...set]); return 1; },
+        srem: async (k: string, v: string) => { const set = new Set(JSON.parse((globalThis as any).__sets?.[k] ?? '[]')); set.delete(v); ((globalThis as any).__sets ??= {})[k] = JSON.stringify([...set]); return 1; },
+        smembers: async (k: string) => JSON.parse((globalThis as any).__sets?.[k] ?? '[]'),
       } as any,
       hasRedis: () => hasRedis,
       config: () =>

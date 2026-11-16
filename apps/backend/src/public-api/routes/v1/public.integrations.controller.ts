@@ -5,6 +5,7 @@ import {
   Delete,
   Get,
   HttpException,
+  OnModuleInit,
   Param,
   Post,
   Put,
@@ -44,6 +45,7 @@ import { GetNotificationsDto } from '@gitroom/nestjs-libraries/dtos/notification
 import * as Sentry from '@sentry/nestjs';
 import { publishReason } from '@gitroom/nestjs-libraries/chat/human.approval';
 import { publicApproval } from '@gitroom/nestjs-libraries/chat/public.approval';
+import { approvalGate } from '@gitroom/nestjs-libraries/chat/human.approval';
 import {
   socialIntegrationList,
   IntegrationManager,
@@ -65,7 +67,7 @@ import dayjs from 'dayjs';
 
 @ApiTags('Public API')
 @Controller('/public/v1')
-export class PublicIntegrationsController {
+export class PublicIntegrationsController implements OnModuleInit {
   constructor(
     private _integrationService: IntegrationService,
     private _postsService: PostsService,
@@ -79,6 +81,67 @@ export class PublicIntegrationsController {
     private _clippingService: ClippingService,
     private _subscriptionService: SubscriptionService
   ) {}
+
+  // What each gated route does once a person approves it in DharaHIL. Used
+  // by the route itself (an agent repeating the call) and by the approval
+  // sweep, which carries it out on its own: one definition, both paths
+  private approvedActions: Record<
+    string,
+    (org: Organization, args: any) => Promise<any>
+  > = {
+    'public.posts.create': (org, args) => this.runCreatePost(org, args),
+    'public.posts.delete': async (org, args) => {
+      const getPostById = await this._postsService.getPost(org.id, args.id);
+      return this._postsService.deletePost(org.id, getPostById.group);
+    },
+    'public.posts.deleteGroup': (org, args) =>
+      this._postsService.deletePost(org.id, args.group),
+    'public.integrations.delete': async (org, args) => {
+      const isTherePosts = await this._integrationService.getPostsForChannel(
+        org.id,
+        args.id
+      );
+      if (isTherePosts.length) {
+        for (const post of isTherePosts) {
+          this._postsService.deletePost(org.id, post.group).catch(() => {});
+        }
+      }
+
+      return this._integrationService.deleteChannel(org.id, args.id);
+    },
+    'public.posts.settings': async (org, args) => {
+      await this.assertUnchanged(org.id, args.id, args.snapshot);
+      return this._postsService.updatePostSettings(
+        org.id,
+        args.id,
+        args.settings,
+        'API'
+      );
+    },
+    'public.posts.status': async (org, args) => {
+      await this.assertUnchanged(org.id, args.id, args.snapshot);
+      return this._postsService.changePostStatus(
+        org.id,
+        args.id,
+        args.status
+      );
+    },
+  };
+
+  onModuleInit() {
+    for (const [action, run] of Object.entries(this.approvedActions)) {
+      approvalGate.registerExecutor(action, {
+        execute: async (orgId, args) => {
+          const org =
+            await this._organizationService.getOrgByIdWithSubscription(orgId);
+          if (!org || org.deletedAt) {
+            throw new Error(`Organization ${orgId} not found`);
+          }
+          return run(org, args);
+        },
+      });
+    }
+  }
 
   @Post('/upload')
   @UseInterceptors(FileInterceptor('file', streamUploadOptions()))
@@ -164,7 +227,7 @@ export class PublicIntegrationsController {
       args: rawBody,
       reason,
       // an approved edit goes through every check below again
-      execute: (args) => this.runCreatePost(org, args),
+      execute: (args) => this.approvedActions['public.posts.create'](org, args),
     });
   }
 
@@ -261,10 +324,7 @@ export class PublicIntegrationsController {
       org: org.id,
       args: { id },
       reason: 'Deleting a post cannot be undone',
-      execute: async (args) => {
-        const getPostById = await this._postsService.getPost(org.id, args.id);
-        return this._postsService.deletePost(org.id, getPostById.group);
-      },
+      execute: (args) => this.approvedActions['public.posts.delete'](org, args),
     });
   }
 
@@ -279,7 +339,8 @@ export class PublicIntegrationsController {
       org: org.id,
       args: { group },
       reason: 'Deleting a post group cannot be undone',
-      execute: (args) => this._postsService.deletePost(org.id, args.group),
+      execute: (args) =>
+        this.approvedActions['public.posts.deleteGroup'](org, args),
     });
   }
 
@@ -625,19 +686,8 @@ export class PublicIntegrationsController {
       org: org.id,
       args: { id },
       reason: 'Deleting a channel and its posts cannot be undone',
-      execute: async (args) => {
-        const isTherePosts = await this._integrationService.getPostsForChannel(
-          org.id,
-          args.id
-        );
-        if (isTherePosts.length) {
-          for (const post of isTherePosts) {
-            this._postsService.deletePost(org.id, post.group).catch(() => {});
-          }
-        }
-
-        return this._integrationService.deleteChannel(org.id, args.id);
-      },
+      execute: (args) =>
+        this.approvedActions['public.integrations.delete'](org, args),
     });
   }
 
@@ -721,15 +771,8 @@ export class PublicIntegrationsController {
       org: org.id,
       args: { id, settings: body.settings, snapshot: snapshot.hash },
       reason: `Changing the settings of a scheduled post: "${snapshot.preview}"`,
-      execute: async (args) => {
-        await this.assertUnchanged(org.id, args.id, args.snapshot);
-        return this._postsService.updatePostSettings(
-          org.id,
-          args.id,
-          args.settings,
-          'API'
-        );
-      },
+      execute: (args) =>
+        this.approvedActions['public.posts.settings'](org, args),
     });
   }
 
@@ -765,14 +808,7 @@ export class PublicIntegrationsController {
       org: org.id,
       args: { id, status: body?.status, snapshot: snapshot.hash },
       reason: `Scheduling a draft to be posted: "${snapshot.preview}"`,
-      execute: async (args) => {
-        await this.assertUnchanged(org.id, args.id, args.snapshot);
-        return this._postsService.changePostStatus(
-          org.id,
-          args.id,
-          args.status
-        );
-      },
+      execute: (args) => this.approvedActions['public.posts.status'](org, args),
     });
   }
 

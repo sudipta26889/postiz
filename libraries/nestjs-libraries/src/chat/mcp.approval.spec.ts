@@ -18,6 +18,10 @@ const fakeRedis = () => {
     },
     del: async (k: string) => (data.delete(k) ? 1 : 0),
     expire: async () => 1,
+    // sets (the pending approvals the sweep carries out)
+    sadd: async (k: string, v: string) => { const set = new Set(JSON.parse((globalThis as any).__sets?.[k] ?? '[]')); set.add(v); ((globalThis as any).__sets ??= {})[k] = JSON.stringify([...set]); return 1; },
+    srem: async (k: string, v: string) => { const set = new Set(JSON.parse((globalThis as any).__sets?.[k] ?? '[]')); set.delete(v); ((globalThis as any).__sets ??= {})[k] = JSON.stringify([...set]); return 1; },
+    smembers: async (k: string) => JSON.parse((globalThis as any).__sets?.[k] ?? '[]'),
   };
 };
 
@@ -120,7 +124,7 @@ describe('approval decision mapping', () => {
     const { gate, calls, redis } = setup([created()]);
     const execute = jest.fn();
     const result: any = await run(gate, execute);
-    expect(result.output.errors).toMatch(/Waiting for human approval/);
+    expect(result.output.errors).toMatch(/Approval requested in DharaHIL/);
     expect(result.output.errors).toContain('req1');
     expect(execute).not.toHaveBeenCalled();
 
@@ -166,7 +170,7 @@ describe('approval decision mapping', () => {
       false
     );
     const again: any = await run(gate, execute);
-    expect(again.output.errors).toMatch(/Waiting for human approval/);
+    expect(again.output.errors).toMatch(/Approval requested in DharaHIL/);
   });
 
   it('refuses an APPROVED request that belongs to another org or tool', async () => {
@@ -314,7 +318,7 @@ describe('fail closed', () => {
       { requestId: 'r', auth: undefined } as any,
       () => wrapped(gate, execute)(args, { mcp: { extra: { authInfo: { id: 'org1' } } } })
     );
-    expect((noSurface as any).output.errors).toMatch(/Waiting/);
+    expect((noSurface as any).output.errors).toMatch(/Approval requested|Still waiting/);
 
     const outsideContext = await wrapped(gate, execute)(args, {
       mcp: { extra: { authInfo: { id: 'org1' } } },

@@ -221,6 +221,27 @@ Effect on the grihatek agents: they get Paperclip's approval **and then** DharaH
 Checks (jest): each gated route returns 428 on first call, the success response after approval, 409 on repeat;
 ungated cases (a future date, drafts) pass straight through; no config or no Redis → 403.
 
+## Phase G3: Postiz carries out approved actions itself (2026-11-17)
+
+Problem: an approval only ran when the agent repeated the identical call. An agent that reworded anything got a new
+request (spam for the owner), and the approved one never ran.
+
+Change:
+- When a request is PENDING, Postiz stores `hil:pending:<requestId>` = `{action, org, args, key}` (TTL = expiry
+  + 7 days) and adds the id to the set `hil:pending`.
+- Every gated action has a registered executor (`approvalGate.registerExecutor`):
+  - each gated MCP tool, in `LoadToolsService.gate`. It runs the un-gated tool as the org, with the same context an
+    MCP call has;
+  - each gated public route, from the controller's single `approvedActions` map, in `onModuleInit`. The route and the
+    sweep share that one definition.
+- `startApprovalSweep()` (from `main.ts`) runs `sweep()` every 30 s, one at a time. For each pending id it does the
+  same `read()` as a repeated call: a named human decider, org/action metadata, validation of approved args, then
+  the at-most-once claim. Then it forgets the item unless it is still pending.
+- A failure of the approval service is retried on the next sweep. A failure of the action itself is not retried
+  (its claim stays).
+- The agent's message now says the action runs automatically once approved and must not be retried or changed.
+  A repeat only reports status (`done` after the sweep ran it).
+
 ## Phase H1: hardening with no schema change (revised)
 
 | Gap | Change |
