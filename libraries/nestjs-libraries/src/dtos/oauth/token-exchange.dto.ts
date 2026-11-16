@@ -35,4 +35,9 @@ export class TokenExchangeDto {
   @IsString()
   @IsOptional()
   redirect_uri?: string;
+
+  // RFC 8707: the MCP resource the token is for
+  @IsString()
+  @IsOptional()
+  resource?: string;
 }

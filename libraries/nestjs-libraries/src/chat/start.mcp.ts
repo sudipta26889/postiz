@@ -86,9 +86,14 @@ export const startMcp = async (app: INestApplication) => {
   const loadToolsService = app.get(LoadToolsService, { strict: false });
   const mcpRelayService = app.get(McpRelayService, { strict: false });
 
-  const resolveAuth = async (token: string) => {
+  // `resource`: the MCP path's canonical URL, so a token bound to another
+  // resource (RFC 8707) is refused here; undefined for /mcp and the API
+  const resolveAuth = async (token: string, resource?: string) => {
     if (token.startsWith('pos_')) {
-      const authorization = await oauthService.getOrgByOAuthToken(token);
+      const authorization = await oauthService.getOrgByOAuthToken(
+        token,
+        resource
+      );
       if (!authorization) return null;
       return authorization.organization;
     }
@@ -238,12 +243,14 @@ export const startMcp = async (app: INestApplication) => {
     '/mcp-oauth-chatgpt': {
       issuer: new URL('/mcp-oauth-chatgpt', process.env.NEXT_PUBLIC_BACKEND_URL!).toString(),
       registration: false,
-      refresh: false,
+      // a dynamic client here gets 1 h tokens (H2): it must see refresh
+      refresh: true,
     },
     '/mcp-oauth-dynamic': {
       issuer: new URL('/mcp-oauth-dynamic', process.env.NEXT_PUBLIC_BACKEND_URL!).toString(),
       registration: true,
-      refresh: false,
+      // MCP clients get rotating refresh tokens (design H2)
+      refresh: true,
     },
     ...(hubspotOAuthClientId
       ? {
@@ -286,10 +293,10 @@ export const startMcp = async (app: INestApplication) => {
         resource: new URL(mcpPath, process.env.NEXT_PUBLIC_BACKEND_URL!).toString(),
         authorizationServers: [authorizationServers[authorizationServer].issuer],
         scopesSupported: oauthScopes,
-        validateToken: async (token: string) => {
+        validateToken: async (token: string, resource?: string) => {
           const org = token.startsWith('psh_')
             ? await resolveSelfHosted(token)
-            : await resolveAuth(token);
+            : await resolveAuth(token, resource);
           if (!org) {
             return { valid: false, error: 'invalid_token', errorDescription: 'Invalid API Key or OAuth token' };
           }
@@ -439,7 +446,9 @@ export const startMcp = async (app: INestApplication) => {
     // a self-hosted connection has no organization here
     const selfHosted = token!.startsWith('psh_');
     const relay = selfHosted ? await resolveSelfHosted(token!) : undefined;
-    const auth = selfHosted ? undefined : await resolveAuth(token!);
+    const auth = selfHosted
+      ? undefined
+      : await resolveAuth(token!, url.toString());
     if (!auth && !(relay && selfHostedServer)) {
       res.status(401).json({ error: 'invalid_token', error_description: 'Could not resolve organization' });
       return;

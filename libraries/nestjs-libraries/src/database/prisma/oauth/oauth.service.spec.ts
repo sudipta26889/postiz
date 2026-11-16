@@ -30,6 +30,8 @@ const staticApp = {
 const service = (app: any, repo: any = {}) =>
   new OAuthService({
     getAppByClientId: jest.fn(async () => app),
+    // no rotating (H2) token by default: these tests are about legacy tokens
+    findTokenByHash: jest.fn(async () => null),
     ...repo,
   } as any);
 
