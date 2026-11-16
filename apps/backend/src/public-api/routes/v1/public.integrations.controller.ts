@@ -5,6 +5,7 @@ import {
   Delete,
   Get,
   HttpException,
+  OnModuleInit,
   Param,
   Post,
   Put,
@@ -22,7 +23,10 @@ import { GetOAuthUserIdFromRequest } from '@gitroom/nestjs-libraries/user/oauth.
 import { Organization } from '@prisma/client';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
 import { CheckPolicies } from '@gitroom/backend/services/auth/permissions/permissions.ability';
-import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
+import {
+  ApprovalPostItem,
+  PostsService,
+} from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { MediaService } from '@gitroom/nestjs-libraries/database/prisma/media/media.service';
 import { GetPostsDto } from '@gitroom/nestjs-libraries/dtos/posts/get.posts.dto';
@@ -42,6 +46,12 @@ import { ClippingService } from '@gitroom/nestjs-libraries/database/prisma/clipp
 import { NotificationService } from '@gitroom/nestjs-libraries/database/prisma/notifications/notification.service';
 import { GetNotificationsDto } from '@gitroom/nestjs-libraries/dtos/notifications/get.notifications.dto';
 import * as Sentry from '@sentry/nestjs';
+import { publishReason } from '@gitroom/nestjs-libraries/chat/human.approval';
+import { publicApproval } from '@gitroom/nestjs-libraries/chat/public.approval';
+import {
+  approvalGate,
+  ApprovalGuard,
+} from '@gitroom/nestjs-libraries/chat/human.approval';
 import {
   socialIntegrationList,
   IntegrationManager,
@@ -63,7 +73,7 @@ import dayjs from 'dayjs';
 
 @ApiTags('Public API')
 @Controller('/public/v1')
-export class PublicIntegrationsController {
+export class PublicIntegrationsController implements OnModuleInit {
   constructor(
     private _integrationService: IntegrationService,
     private _postsService: PostsService,
@@ -77,6 +87,146 @@ export class PublicIntegrationsController {
     private _clippingService: ClippingService,
     private _subscriptionService: SubscriptionService
   ) {}
+
+  // What each gated route does once a person approves it in DharaHIL. Used
+  // by the route itself (an agent repeating the call) and by the approval
+  // sweep, which carries it out on its own: one definition, both paths
+  private approvedActions: Record<
+    string,
+    (org: Organization, args: any) => Promise<any>
+  > = {
+    'public.posts.create': (org, args) => this.runCreatePost(org, args),
+    'public.posts.delete': async (org, args) => {
+      const getPostById = await this._postsService.getPost(org.id, args.id);
+      // already gone: nothing to do, said plainly (not an unknown outcome)
+      if (!getPostById) {
+        throw new HttpException({ msg: 'Post not found, nothing deleted' }, 404);
+      }
+      return this._postsService.deletePost(org.id, getPostById.group);
+    },
+    'public.posts.deleteGroup': (org, args) =>
+      this._postsService.deletePost(org.id, args.group),
+    'public.integrations.delete': async (org, args) => {
+      const isTherePosts = await this._integrationService.getPostsForChannel(
+        org.id,
+        args.id
+      );
+      if (isTherePosts.length) {
+        for (const post of isTherePosts) {
+          this._postsService.deletePost(org.id, post.group).catch(() => {});
+        }
+      }
+
+      return this._integrationService.deleteChannel(org.id, args.id);
+    },
+    'public.posts.settings': async (org, args) => {
+      await this.assertUnchanged(org.id, args.id, args.snapshot);
+      return this._postsService.updatePostSettings(
+        org.id,
+        args.id,
+        args.settings,
+        'API'
+      );
+    },
+    'public.posts.status': async (org, args) => {
+      await this.assertUnchanged(org.id, args.id, args.snapshot);
+      return this._postsService.changePostStatus(
+        org.id,
+        args.id,
+        args.status
+      );
+    },
+  };
+
+  // Duplicate protection for the routes that publish (design G4 v3); the
+  // decision is PostsService's, the same one the MCP schedule tool uses
+  private publishItems(args: any): ApprovalPostItem[] {
+    if (args?.type === 'draft') {
+      return [];
+    }
+    return (Array.isArray(args?.posts) ? args.posts : []).map((p: any) => ({
+      integrationId: p?.integration?.id,
+      content: p?.value?.[0]?.content || '',
+      media: p?.value?.[0]?.image || [],
+      label: `channel ${p?.integration?.id} at ${args?.date}`,
+    }));
+  }
+
+  // posts this call edits (an update keeps their ids): they must not count
+  // as copies of themselves
+  private editedPostIds(args: any): string[] {
+    return (Array.isArray(args?.posts) ? args.posts : [])
+      .flatMap((p: any) => (Array.isArray(p?.value) ? p.value : []))
+      .map((v: any) => v?.id)
+      .filter((id: unknown): id is string => typeof id === 'string' && !!id);
+  }
+
+  private approvalGuards: Record<string, ApprovalGuard> = {
+    'public.posts.create': {
+      fingerprint: (args) =>
+        this._postsService.approvalFingerprint(this.publishItems(args)),
+      locks: (args, org) =>
+        this._postsService.approvalLocks(org, this.publishItems(args)),
+      check: async (args, org, phase, shown) => {
+        // never a delete as a side effect of the save, then the duplicates
+        const refuse = await this._postsService.approvalSaveCheck(
+          org,
+          args,
+          phase
+        );
+        if (refuse) {
+          return { refuse };
+        }
+        return this._postsService.approvalDuplicateCheck(
+          org,
+          this.publishItems(args),
+          phase,
+          shown,
+          this.editedPostIds(args)
+        );
+      },
+      channels: (args) =>
+        this.publishItems(args).map((item) => item.integrationId),
+    },
+    // the draft already exists: it can't double itself, but its text may
+    // already be queued or published on that channel by another post
+    'public.posts.status': {
+      fingerprint: () => null,
+      locks: async (args, org) =>
+        this._postsService.approvalLocks(
+          org,
+          await this._postsService.approvalItemsOfPost(org, args.id)
+        ),
+      check: async (args, org, phase, shown) =>
+        this._postsService.approvalDuplicateCheck(
+          org,
+          await this._postsService.approvalItemsOfPost(org, args.id),
+          phase,
+          shown,
+          [args.id]
+        ),
+    },
+  };
+
+  onModuleInit() {
+    // what an approval came to, when no agent is there to hear it
+    approvalGate.registerNotifier((org, subject, message) =>
+      this._notificationService.inAppNotification(org, subject, message, true)
+    );
+    for (const [action, run] of Object.entries(this.approvedActions)) {
+      approvalGate.registerExecutor(action, {
+        guard: this.approvalGuards[action],
+        execute: async (orgId, args) => {
+          const org =
+            await this._organizationService.getOrgByIdWithSubscription(orgId);
+          if (!org || org.deletedAt) {
+            throw new Error(`Organization ${orgId} not found`);
+          }
+          return run(org, args);
+        },
+      });
+    }
+  }
 
   @Post('/upload')
   @UseInterceptors(FileInterceptor('file', streamUploadOptions()))
@@ -151,6 +301,33 @@ export class PublicIntegrationsController {
     @Body() rawBody: any
   ) {
     Sentry.metrics.count('public_api-request', 1);
+    // anything that will be posted needs a human (DharaHIL); drafts don't
+    const reason = publishReason([{ type: rawBody?.type }]);
+    if (reason === null) {
+      // a draft needs no approval, but it may not turn a post that already
+      // went out back into a draft (which could then be scheduled again)
+      const refuse = await this._postsService.approvalSaveCheck(
+        org.id,
+        rawBody,
+        'draft'
+      );
+      if (refuse) {
+        throw new HttpException({ msg: refuse }, 400);
+      }
+      return this.runCreatePost(org, rawBody);
+    }
+    return publicApproval.run({
+      action: 'public.posts.create',
+      org: org.id,
+      args: rawBody,
+      reason,
+      // an approved edit goes through every check below again
+      guard: this.approvalGuards['public.posts.create'],
+      execute: (args) => this.approvedActions['public.posts.create'](org, args),
+    });
+  }
+
+  private async runCreatePost(org: Organization, rawBody: any) {
     const body = await this._postsService.mapTypeToPost(
       {
         ...rawBody,
@@ -237,8 +414,14 @@ export class PublicIntegrationsController {
     @Param('id') id: string
   ) {
     Sentry.metrics.count('public_api-request', 1);
-    const getPostById = await this._postsService.getPost(org.id, id);
-    return this._postsService.deletePost(org.id, getPostById.group);
+    // deleting cannot be undone: a human approves it (DharaHIL)
+    return publicApproval.run({
+      action: 'public.posts.delete',
+      org: org.id,
+      args: { id },
+      reason: 'Deleting a post cannot be undone',
+      execute: (args) => this.approvedActions['public.posts.delete'](org, args),
+    });
   }
 
   @Delete('/posts/group/:group')
@@ -247,7 +430,14 @@ export class PublicIntegrationsController {
     @Param('group') group: string
   ) {
     Sentry.metrics.count('public_api-request', 1);
-    return this._postsService.deletePost(org.id, group);
+    return publicApproval.run({
+      action: 'public.posts.deleteGroup',
+      org: org.id,
+      args: { group },
+      reason: 'Deleting a post group cannot be undone',
+      execute: (args) =>
+        this.approvedActions['public.posts.deleteGroup'](org, args),
+    });
   }
 
   @Get('/is-connected')
@@ -586,17 +776,15 @@ export class PublicIntegrationsController {
     @Param('id') id: string
   ) {
     Sentry.metrics.count('public_api-request', 1);
-    const isTherePosts = await this._integrationService.getPostsForChannel(
-      org.id,
-      id
-    );
-    if (isTherePosts.length) {
-      for (const post of isTherePosts) {
-        this._postsService.deletePost(org.id, post.group).catch(() => {});
-      }
-    }
-
-    return this._integrationService.deleteChannel(org.id, id);
+    // deleting a channel deletes its posts too: a human approves it (DharaHIL)
+    return publicApproval.run({
+      action: 'public.integrations.delete',
+      org: org.id,
+      args: { id },
+      reason: 'Deleting a channel and its posts cannot be undone',
+      execute: (args) =>
+        this.approvedActions['public.integrations.delete'](org, args),
+    });
   }
 
   @Get('/integration-settings/:id')
@@ -662,12 +850,42 @@ export class PublicIntegrationsController {
     @Body() body: UpdatePostSettingsDto
   ) {
     Sentry.metrics.count('public_api-request', 1);
-    return this._postsService.updatePostSettings(
-      org.id,
-      id,
-      body.settings,
-      'API'
-    );
+    // only a scheduled (QUEUE) post's settings change what goes out, so only
+    // those ask a human (DharaHIL); drafts are free, and anything else is
+    // refused by the service at once instead of paging a person for nothing
+    const snapshot = await this._postsService.approvalSnapshot(org.id, id);
+    if (snapshot.state !== 'QUEUE') {
+      return this._postsService.updatePostSettings(
+        org.id,
+        id,
+        body.settings,
+        'API'
+      );
+    }
+    return publicApproval.run({
+      action: 'public.posts.settings',
+      org: org.id,
+      args: { id, settings: body.settings, snapshot: snapshot.hash },
+      reason: `Changing the settings of a scheduled post: "${snapshot.preview}"`,
+      execute: (args) =>
+        this.approvedActions['public.posts.settings'](org, args),
+    });
+  }
+
+  // The post must be exactly what the human approved: a change made since
+  // (content, settings, date, channel, state) needs a new approval
+  private async assertUnchanged(orgId: string, id: string, hash: string) {
+    const now = await this._postsService.approvalSnapshot(orgId, id);
+    if (now.hash !== hash) {
+      throw new HttpException(
+        {
+          msg: 'The post changed after it was approved; send the request again to ask for a new approval',
+          // checked before anything is written: nothing was done
+          nothingDone: true,
+        },
+        409
+      );
+    }
   }
 
   @Put('/posts/:id/status')
@@ -677,7 +895,34 @@ export class PublicIntegrationsController {
     @Body() body: ChangePostStatusDto
   ) {
     Sentry.metrics.count('public_api-request', 1);
-    return this._postsService.changePostStatus(org.id, id, body.status);
+    // the human sees what will go out, and the hash ties the approval to it
+    const snapshot = await this._postsService.approvalSnapshot(org.id, id);
+    // Only queued <-> draft. A published or failed post never becomes a
+    // draft (that would let it be scheduled, and so posted, again)
+    if (body?.status === 'draft') {
+      if (snapshot.state !== 'QUEUE' && snapshot.state !== 'DRAFT') {
+        throw new HttpException(
+          { msg: `Only a scheduled post can be moved back to draft (this one is ${snapshot.state})` },
+          400
+        );
+      }
+      return this._postsService.changePostStatus(org.id, id, body.status);
+    }
+    // moving a draft to 'schedule' posts it: a human approves that (DharaHIL)
+    if (snapshot.state !== 'DRAFT') {
+      throw new HttpException(
+        { msg: `Only a draft can be scheduled here (this one is ${snapshot.state}); nothing was filed` },
+        400
+      );
+    }
+    return publicApproval.run({
+      action: 'public.posts.status',
+      org: org.id,
+      args: { id, status: body?.status, snapshot: snapshot.hash },
+      reason: `Scheduling a draft to be posted: "${snapshot.preview}"`,
+      guard: this.approvalGuards['public.posts.status'],
+      execute: (args) => this.approvedActions['public.posts.status'](org, args),
+    });
   }
 
   @Put('/posts/:id/release-id')

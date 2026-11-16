@@ -1281,6 +1281,54 @@ export class PostsRepository {
     });
   }
 
+  // The live posts already in a group (this org): saving into the group
+  // replaces them, so they must all be named by the save
+  getPostIdsInGroup(orgId: string, group: string) {
+    return this._post.model.post.findMany({
+      where: { organizationId: orgId, group, deletedAt: null },
+      select: { id: true, state: true },
+    });
+  }
+
+  // The state of posts a request says it edits (this org only)
+  getPostStates(orgId: string, ids: string[]) {
+    return this._post.model.post.findMany({
+      where: { organizationId: orgId, id: { in: ids }, deletedAt: null },
+      select: { id: true, state: true },
+    });
+  }
+
+  // The posts an approved agent post could duplicate: live main posts on
+  // these channels, queued, or published/failed in the last week
+  getRecentChannelPosts(
+    orgId: string,
+    integrationIds: string[],
+    since: Date,
+    excludePostIds: string[] = []
+  ) {
+    return this._post.model.post.findMany({
+      where: {
+        organizationId: orgId,
+        integrationId: { in: integrationIds },
+        deletedAt: null,
+        parentPostId: null,
+        ...(excludePostIds.length ? { id: { notIn: excludePostIds } } : {}),
+        OR: [
+          { state: 'QUEUE' },
+          { state: { in: ['PUBLISHED', 'ERROR'] }, publishDate: { gte: since } },
+        ],
+      },
+      select: {
+        id: true,
+        integrationId: true,
+        content: true,
+        image: true,
+        state: true,
+        publishDate: true,
+      },
+    });
+  }
+
   async getPostsSince(orgId: string, since: string) {
     return this._post.model.post.findMany({
       where: {

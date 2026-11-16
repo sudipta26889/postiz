@@ -89,7 +89,10 @@ Rollback: remove the edge routes and unset `MCP_URL`. No app code, data or schem
 
 ## Owner decisions (2026-11-16)
 
-1. Delete and publish-now tools **stay**, and every MCP call to them goes through **DharaHIL** human approval and
+1. **Correction 2026-11-17 (owner):** nothing is posted and nothing is deleted without a human. Deleting, and
+   posting anything (now **or scheduled, at any date**), goes through DharaHIL; only drafts don't. The first version
+   gated only "publish-now" (within 5 minutes), which let an agent post anything by scheduling it 6 minutes ahead.
+   Original wording: delete and publish-now tools **stay**, and every MCP call to them goes through **DharaHIL** human approval and
    fails closed. This is the TaskPilot / ERPNext pattern. → Phase G.
 2. OAuth hardening: **do it properly, in this fork** (Postiz already has an authorization server that only needs
    fixing, so the fleet rule doesn't make us wait for Studio). → Phases H1 to H3.
@@ -108,7 +111,7 @@ There are no tests in the repo. `jest.config.ts` and `jest.preset.js` need `@nx/
   `jest.preset.js` if nothing else uses it.
 - Check: `pnpm test` runs one trivial spec and passes. This ships inside the Phase G PR.
 
-## Phase G: DharaHIL approval for delete and publish-now over MCP (revised after review)
+## Phase G: DharaHIL approval for deleting and posting over MCP (revised after review and the owner's correction)
 
 Facts the design rests on (verified):
 - The gateway reuses a request for the same `idempotency_key` **only while it is PENDING**
@@ -123,7 +126,7 @@ Facts the design rests on (verified):
 One generic wrapper enforces it, so the helper never names a tool.
 - `deletePostTool` (`tools/delete.post.tool.ts:45`) is always gated.
 - `schedulePostTool` (`tools/integration.schedule.post.ts:173`) is gated when **any** `socialPost` item has
-  `type == "now"`, or a date at or before now + 5 minutes. The whole call is gated, after validation (`:181-247`)
+  is not `draft` (now **or scheduled at any date**; superseded rule was "now or within 5 minutes"). The whole call is gated, after validation (`:181-247`)
   and before the `createPost` loop (`:249`).
 
 **Where it applies: fail closed.** Every `runWithContext` call in `start.mcp.ts` (`:396`, `:446`, `:486`, `:525`) sets
@@ -162,7 +165,7 @@ gated actions outright with "not available through the relay".
    - `EXECUTED`: "already done".
    - `REJECTED`, `AUTO_DENIED`, `EXPIRED`, `REVISE_REQUESTED`, `DENY` or any unknown status: delete the mapping and
      return `isError` with the reason. A later call starts a fresh request.
-   - Any `date` that doesn't parse counts as publish-now (gated).
+   - An empty or missing post list is gated (fail closed).
    - In-app chat check on dev: `copilot.controller.ts:85-113` sets a Mastra `requestContext`. Confirm that ALS
      `surface: 'app'` reaches the tools through CopilotRuntime. If it doesn't, in-app delete gets gated, which fails
      closed but must be fixed before release.
@@ -170,10 +173,10 @@ gated actions outright with "not available through the relay".
    on**; there is no off switch. With config missing, gated actions return `isError` "approval service not configured".
    Add the keys to `soul/stack.yml`, `.env.example` and the Portainer Env.
 
-**Not gated:** future scheduling, drafts, edits and reads. This is the owner's scope: delete and publish-now only.
+**Not gated:** drafts and reads. Everything that will be posted, and every delete, is gated (owner, 2026-11-17).
 
 **Rollout dependency:** the DharaHIL `postiz` app must exist before this deploys. Otherwise every MCP delete or
-publish-now is refused, which changes behaviour for the key-based agents that use them today.
+posting or scheduling is refused, which changes behaviour for the key-based agents that use them today.
 
 **Checks (jest):**
 - Key stability: canonical order gives the same key; different args or a different org give a different key.
@@ -181,9 +184,164 @@ publish-now is refused, which changes behaviour for the key-based agents that us
 - The claim, against a mocked ioredis that honours NX: a second execution is refused; `running` and `done` give
   different messages; a missing `REDIS_URL` (MockRedis) refuses.
 - Edited `approved_args` that fail validation, or that point at another org's integration, are refused.
-- The trigger: `now`, a past date and a date within 5 minutes are gated; a future date and drafts are not.
+- The trigger: `now`, `schedule` at any date, `update` and unknown types are gated; only all-draft calls pass.
 - Fail closed: no config gives an error, and an undefined surface is gated.
 - Dev-instance run-through: delete → waiting → approve → deleted → call again → "already done".
+
+## Phase G2: the same gate on the public REST API (ships in the same PR as G)
+
+Gap: the org API key (and `pos_` tokens, `public.auth.middleware.ts:32-38`) also works on the public API
+(`apps/backend/src/public-api/routes/v1/public.integrations.controller.ts`). Without a gate there, the MCP-only gate
+is bypassed by calling REST. The grihatek agents post through a Paperclip "postiz-api-key-shim" over this API.
+
+Gated routes (owner's rule: nothing posted or deleted without a human):
+- `PUT /public/v1/posts/:id/status` to `schedule` (moves a draft into the posting queue).
+- `POST /public/v1/posts` (`:147`) unless it is a draft (superseded: only now / within 5 min / an
+  unparseable date. The trigger rule is the one from Phase G, shared.
+- `DELETE /public/v1/posts/:id` (`:234`) and `DELETE /public/v1/posts/group/:group` (`:244`).
+
+How: the same `human.approval.ts` helper, called from the controller (or its service) with a generic action name
+(`public.posts.create`, `public.posts.delete`, `public.posts.deleteGroup`) and the request body/params as args.
+Same key, Redis map, claim and fail-closed rules.
+
+HTTP answers. A pending approval must never look like success to a REST client:
+- Pending → **HTTP 428 Precondition Required**, JSON `{ status: "approval_pending", requestId, expiresAt,
+  message: "Repeat the identical request after approval in DharaHIL" }`.
+- Rejected, expired, denied or misconfigured → **403** with the reason.
+- `done` claim on a repeat → **409** "already done (request <id>)". `running` → **409** with the "result unknown" text.
+- Approved and first claim → the normal success response.
+
+Not gated: the frontend's own `/posts` routes (a signed-in person, same as the in-app chat), future scheduling,
+drafts, edits, reads. Deleting a channel (`DELETE /public/v1/integrations/:id`, `:583`) is outside the owner's
+scope as stated; it's listed for the owner to decide.
+
+Effect on the grihatek agents: they get Paperclip's approval **and then** DharaHIL's. Their shim must treat 428 as
+"wait and retry", not as a failure. The Paperclip owner must be told before release (through Guardian).
+
+Checks (jest): each gated route returns 428 on first call, the success response after approval, 409 on repeat;
+ungated cases (a future date, drafts) pass straight through; no config or no Redis → 403.
+
+## Phase G3: Postiz carries out approved actions itself (2026-11-17)
+
+Problem: an approval only ran when the agent repeated the identical call. An agent that reworded anything got a new
+request (spam for the owner), and the approved one never ran.
+
+Change:
+- When a request is PENDING, Postiz stores `hil:pending:<requestId>` = `{action, org, args, key}` (TTL = expiry
+  + 7 days) and adds the id to the set `hil:pending`.
+- Every gated action has a registered executor (`approvalGate.registerExecutor`):
+  - each gated MCP tool, in `LoadToolsService.gate`. It runs the un-gated tool as the org, with the same context an
+    MCP call has;
+  - each gated public route, from the controller's single `approvedActions` map, in `onModuleInit`. The route and the
+    sweep share that one definition.
+- `startApprovalSweep()` (from `main.ts`) runs `sweep()` every 30 s, one at a time. For each pending id it does the
+  same `read()` as a repeated call: a named human decider, org/action metadata, validation of approved args, then
+  the at-most-once claim. Then it forgets the item unless it is still pending.
+- A failure of the approval service is retried on the next sweep. A failure of the action itself is not retried
+  (its claim stays).
+- The agent's message now says the action runs automatically once approved and must not be retried or changed.
+  A repeat only reports status (`done` after the sweep ran it).
+
+## Phase G4 (v3): duplicates, decided from what is actually posted (2026-11-17)
+
+History:
+- v1 (commit 4ec04b3b) keyed on channel + minute + action name and was blocked: it doubled posts and dropped real ones.
+- v2 (design only) kept its own Redis ledger of what ran, and was sent back: the ledger expired before far-future
+  posts went out, didn't notice deletes, ignored media, and needed multi-key atomic moves.
+
+v3 asks Postgres directly, as the record of what is really queued or published, and uses Redis only for short locks
+and the pending-request pointer.
+
+**Requirements.** (A) An agent never causes the same post or delete twice, however it retries: reworded fields,
+another date format, "now" retries, split or merged channels, MCP or REST. (B) A genuinely different post is never
+silently dropped, and nothing is reported as success when it didn't run. Anything ambiguous goes to the owner with
+context.
+
+### Identity of a post item (revised after the v3 review)
+Only the **main post** counts (the first item; comments are stored separately through `parentPostId`, so they're left
+out). Two fingerprints per channel item:
+- **exact** = `channelId + sha256(normText(withUrls) + "\u0001" + sorted media PATHS)`;
+- **loose** = `channelId + sha256(normText(withoutUrls))`.
+
+`normText`:
+- turn `</p>`, `<br>` and block tags into a space, then strip tags;
+- decode entities, apply NFC, drop zero-width characters;
+- collapse whitespace, trim and lower-case;
+- keep the mention ids.
+
+Media ids are never used. The MCP tool makes new ids, and `convertToJPEG` re-uploads under new paths. The minute,
+type, settings and path (MCP or REST) are left out, so both compute the same fingerprints through one shared function.
+
+### At execution (sweep or repeat): the safety rule
+For each channel item of a create (MCP schedule tool, `POST /public/v1/posts`) or a draft → schedule move:
+1. **Locks.** Take `hil:lock:post:<org>:<loose>` with `SET key <random token> NX PX 300000`, in sorted order. If any
+   is held elsewhere, release the ones taken (Lua compare-and-delete on the token) and wait for the next sweep: never
+   refuse, never run. Release the same way when done.
+2. **Postgres read** (new repository method, no raw SQL): `post.findMany` where `organizationId`, `integrationId in
+   channels`, `deletedAt null`, `parentPostId null`, and (state QUEUE, or state PUBLISHED/ERROR with `publishDate`
+   ≥ 7 days ago). Select `id, integrationId, content, image, state, publishDate`. A draft → schedule move excludes
+   its own post. This is covered by the existing index (`schema.prisma:502`).
+3. **Compare.**
+   - **Exact** match with a QUEUE or PUBLISHED post → **refuse the whole request**. `/executed` false: "duplicate of
+     post X on channel Y". Nothing runs.
+   - **Near** match (same loose fingerprint but not exact: links differ, images re-saved, or the earlier post is in
+     ERROR) → run **only if** the post ids it resembles are among those the owner was shown in this request's
+     warning (stored with the pending entry). Otherwise refuse as above: "resembles post X, which the owner wasn't
+     shown".
+   - No match → create.
+
+### At request time (to spare and inform the owner, not for safety)
+The same read and compare, with no locks:
+- exact match → error to the agent (MCP `isError`, REST 409): "This exact post already exists as X on Y". Nothing
+  filed;
+- near match → file, with the DharaHIL summary starting "⚠ Resembles post X on Y (<state>, <date>): '<preview>'".
+  The ids shown are stored with the pending entry (rule 3);
+- an identical request already pending → join it after re-reading its status; a dead one's pointer is dropped. The
+  agent is told R's content is what will run and nothing new was filed;
+- a pending request on the same channel with a different fingerprint → file, with "⚠ Possible duplicate of pending
+  request R".
+
+### No-op, failure, partial crash
+- A no-op (validation error, or a delete of a missing post or channel: an explicit not-found check, not a crash) →
+  `/executed` false with the reason, and the pending entry is dropped. REST executors register `isNoop` for
+  `PostValidationException` and not-found.
+- An exception after a possible write: whatever was written is in Postgres, so rule 3 catches a retry. The error
+  given to the agent lists the channels that **were not** posted ("resend those alone"), worked out from the same
+  read.
+- Sweep: one sweep at a time per process. Across replicas the per-identity locks plus the Postgres read rule out
+  doubles, so no global sweep lock is needed.
+
+### Explicitly accepted
+- An exact repeat (same text, same links, same images) on the same channel while the earlier one is queued, or was
+  published in the last 7 days, is refused with the reason. A deliberate repost is done in the web app.
+- Posts that differ only in their comments count as the same post.
+- DharaHIL has no cancel endpoint. A request joined after a race stays in the owner's queue, and rule 3 stops it from
+  posting twice.
+
+## Phase G5: every outcome is reported, and the queue can't fail silently (2026-11-17)
+
+- **Expiry.** A request nobody decided in time (EXPIRED, AUTO_DENIED) is reported to the organization once, in-app
+  and by e-mail through `NotificationService` (`approvalGate.registerNotifier`). The agent's next identical call
+  answers "not approved (EXPIRED); nothing was carried out", and the call after that files a new request. A rejection
+  by the owner isn't notified, because the owner made it.
+- **Approved but not carried out** (duplicate at execution, a no-op, a failure): DharaHIL gets
+  `/executed` `executed=false` with the reason, and the organization is notified once (`hil:notified:<id>`).
+- **Crash order.** A request already claimed (`hil:exec:<id>`) is answered from its own state (done, or outcome
+  unknown) before any duplicate check, so it never calls its own posts duplicates.
+- **Status route.** Only queued ↔ draft. A published or failed post can't become a draft, and only a draft can be
+  scheduled (400, nothing filed), so a post that went out can't be re-queued.
+- **Edits.** Posts being edited are excluded from the duplicate check. "Not posted" is listed per post (label).
+- **Pending look-alikes.** A different request still waiting for the same channel puts "⚠ Possible duplicate of
+  pending request R" first.
+- **Redis.**
+  - The waiting list is one JSON key, changed only inside EVAL scripts with GET/SET. Postiz's rate limiter already
+    runs those in production on every request, so they're allowed. No set commands are used.
+  - Lock release falls back to compare-then-delete if EVAL is ever refused.
+  - At start, `selfTest()` tries every operation the gate needs. If one fails, it logs the reason, and the gate
+    refuses gated actions with 503 and that reason.
+- **Agent wording.** "To learn the outcome later, call again with the same arguments: it reports done, still waiting,
+  expired or not carried out."
+- **Expiry length** is set by the DharaHIL policy, not per request. Postiz asks for 24 h (86400 s).
 
 ## Phase H1: hardening with no schema change (revised)
 
@@ -263,8 +421,8 @@ Flow:
 ## Owner-visible choices made in this revision
 
 - Static OAuth apps and HubSpot keep long-lived tokens. Only MCP clients get the 1 h / rotating model.
-- The gate has no off switch. If DharaHIL is missing or down, MCP delete and publish-now are refused.
-- "Publish now" includes a schedule dated within 5 minutes of now.
+- The gate has no off switch. If DharaHIL is missing or down, deleting and posting over MCP and the public API are refused.
+- Every non-draft post needs approval, whatever its date (owner, 2026-11-17).
 - Gated actions through a self-hosted relay are refused (the relay is not used here).
 
 ## Upstream

@@ -10,6 +10,7 @@ export class DeletePostTool implements AgentToolInterface {
   constructor(private _postsService: PostsService) {}
   name = 'deletePostTool';
   optionalOnSelfHosted = true;
+  approval = () => 'Deleting a post cannot be undone';
 
   run() {
     return createTool({

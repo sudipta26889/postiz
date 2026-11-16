@@ -3,11 +3,18 @@ import { createTool } from '@mastra/core/tools';
 import { z } from 'zod';
 import { Injectable } from '@nestjs/common';
 import { IntegrationService } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.service';
-import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
+import {
+  ApprovalPostItem,
+  PostsService,
+} from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
 import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 import { AllProvidersSettings } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/all.providers.settings';
 import { Integration } from '@prisma/client';
 import { checkAuth } from '@gitroom/nestjs-libraries/chat/auth.context';
+import {
+  ApprovalGuard,
+  publishReason,
+} from '@gitroom/nestjs-libraries/chat/human.approval';
 import {
   ValidUrlExtension,
   ValidUrlPath,
@@ -58,6 +65,12 @@ const toMedia = (
         thumbnailTimestamp: a.thumbnailTimestamp,
       };
 
+// Any item that will be posted (now or scheduled) gates the whole call;
+// drafts never do. The rule is shared with the public API (human.approval.ts).
+export const scheduleApproval = (inputData: {
+  socialPost?: { type?: string }[];
+}): string | null => publishReason(inputData?.socialPost);
+
 @Injectable()
 export class IntegrationSchedulePostTool implements AgentToolInterface {
   constructor(
@@ -65,6 +78,54 @@ export class IntegrationSchedulePostTool implements AgentToolInterface {
     private _integrationService: IntegrationService
   ) {}
   name = 'integrationSchedulePostTool';
+  approval = scheduleApproval;
+
+  // The posts this call would publish (drafts never do), as the duplicate
+  // check sees them; the check itself is PostsService's, shared with REST
+  private approvalItems(args: any): ApprovalPostItem[] {
+    return (args?.socialPost || [])
+      .filter((p: any) => p?.type !== 'draft')
+      .map((p: any) => ({
+        integrationId: p.integrationId,
+        content: p.postsAndComments?.[0]?.content || '',
+        media: p.postsAndComments?.[0]?.attachments || [],
+        label: `channel ${p.integrationId} at ${p.date}`,
+      }));
+  }
+
+  approvalGuard: ApprovalGuard = {
+    fingerprint: (args) =>
+      this._postsService.approvalFingerprint(this.approvalItems(args)),
+    locks: (args, org) =>
+      this._postsService.approvalLocks(org, this.approvalItems(args)),
+    check: (args, org, phase, shown) =>
+      this._postsService.approvalDuplicateCheck(
+        org,
+        this.approvalItems(args),
+        phase,
+        shown
+      ),
+    channels: (args) =>
+      this.approvalItems(args).map((item) => item.integrationId),
+  };
+
+  // A human may have edited the approved args: every channel must still be
+  // one of this organization's (the rest of the checks run in execute)
+  async approvalValidate(
+    args: { socialPost: { integrationId: string }[] },
+    orgId: string
+  ) {
+    for (const p of args.socialPost) {
+      const integration = await this._integrationService.getIntegrationById(
+        orgId,
+        p.integrationId
+      );
+      if (!integration) {
+        return `Channel ${p.integrationId} was not found in this organization`;
+      }
+    }
+    return null;
+  }
 
   run() {
     return createTool({

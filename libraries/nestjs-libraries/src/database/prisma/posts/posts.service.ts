@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import {
   BadRequestException,
   Injectable,
@@ -63,6 +64,15 @@ type PostWithConditionals = Post & {
   integration?: Integration;
   childrenPost: Post[];
 };
+
+// A post item an agent asks to publish, as both MCP and REST describe it
+export interface ApprovalPostItem {
+  integrationId: string;
+  content: string;
+  media: unknown;
+  // how to name it in a message (channel and date), when known
+  label?: string;
+}
 
 @Injectable()
 export class PostsService {
@@ -489,6 +499,322 @@ export class PostsService {
           )
         : []),
     ];
+  }
+
+  // What a human approves in DharaHIL before a scheduled post changes: a
+  // preview to read, the state, and a hash of everything that goes out, so
+  // a change made after the approval is caught before it runs
+  async approvalSnapshot(orgId: string, postId: string) {
+    const ordered = await this.getPostsRecursively(postId, true, orgId, true);
+    const [root] = ordered;
+    if (!root) {
+      throw new NotFoundException('Post not found');
+    }
+
+    return {
+      state: root.state,
+      preview: stripHtmlValidation('none', root.content || '').slice(0, 300),
+      hash: createHash('sha256')
+        .update(
+          JSON.stringify(
+            ordered.map((p) => ({
+              id: p.id,
+              content: p.content,
+              settings: p.settings,
+              image: p.image,
+              publishDate: p.publishDate,
+              integrationId: p.integrationId,
+              state: p.state,
+            }))
+          )
+        )
+        .digest('hex'),
+    };
+  }
+
+  // --- Duplicates of agent posts a person approves (DharaHIL) -------------
+  // A post's text as a person reads it: tags gone (blocks become spaces),
+  // entities decoded, mention ids kept, invisible characters dropped. URLs
+  // are dropped for the loose fingerprint, because link shortening rewrites
+  // them before saving
+  private approvalText(html: string, keepUrls: boolean) {
+    const text = stripHtmlValidation(
+      'none',
+      (html || '')
+        .replace(/<span[^>]*data-id="([^"]+)"[^>]*>/gi, ' @$1 ')
+        .replace(/<\/(p|h1|h2|h3|li|ul|ol|div)>|<br\s*\/?>/gi, ' ')
+    )
+      .normalize('NFC')
+      .replace(/[\u200B-\u200D\uFEFF]/g, '');
+    return (keepUrls ? text : text.replace(/https?:\/\/\S+/gi, ' '))
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
+  // Media by path only: ids are new on every MCP call
+  private approvalMedia(image: unknown): string[] {
+    let list: unknown = image;
+    if (typeof image === 'string') {
+      try {
+        list = JSON.parse(image);
+      } catch {
+        list = [];
+      }
+    }
+    return (Array.isArray(list) ? list : [])
+      .map((m: any) => (typeof m === 'string' ? m : m?.path))
+      .filter((path: unknown): path is string => typeof path === 'string')
+      .sort();
+  }
+
+  // exact: same channel, text with its links, and media; loose: same channel
+  // and text without links (what a shortened or re-uploaded copy keeps)
+  approvalFingerprints(item: ApprovalPostItem) {
+    const hash = (value: string) =>
+      createHash('sha256').update(value).digest('hex').slice(0, 32);
+    return {
+      exact: hash(
+        `${item.integrationId}|${this.approvalText(item.content, true)}\u0001${this.approvalMedia(item.media).join('\u0002')}`
+      ),
+      loose: hash(
+        `${item.integrationId}|${this.approvalText(item.content, false)}`
+      ),
+    };
+  }
+
+  // An agent's "edit" may only touch this org's drafts or queued posts.
+  // Editing a published or failed post would turn it back into a draft or a
+  // queued post, and so post it again. Used by every agent path that can
+  // name existing post ids, gated or not (drafts skip approval)
+  async approvalEditCheck(
+    orgId: string,
+    ids: string[],
+    phase: 'request' | 'execute' | 'draft' = 'request',
+    // saving into an existing group deletes every post of the group the save
+    // doesn't name: that would be a delete without approval, so the save must
+    // name them all (a delete goes through the approved delete route)
+    group?: string
+  ): Promise<{ refuse?: string; editable: string[] }> {
+    const nothing =
+      phase === 'execute' ? 'posted' : phase === 'draft' ? 'saved' : 'filed';
+    if (group) {
+      const inGroup = await this._postRepository.getPostIdsInGroup(
+        orgId,
+        group
+      );
+      const dropped = inGroup.filter((p) => !ids.includes(p.id));
+      if (dropped.length) {
+        return {
+          editable: [],
+          refuse: `This would delete ${dropped
+            .map((p) => `post ${p.id} (${p.state})`)
+            .join(', ')} of group ${group}, which it doesn't include. Deleting needs the approved delete route. Nothing was ${nothing}.`,
+        };
+      }
+    }
+    if (!ids.length) {
+      return { editable: [] };
+    }
+    const found = await this._postRepository.getPostStates(orgId, ids);
+    const refused = found.filter(
+      (p) => p.state !== 'DRAFT' && p.state !== 'QUEUE'
+    );
+    if (refused.length) {
+      return {
+        editable: [],
+        refuse: `This edits ${refused
+          .map((p) => `post ${p.id} (${p.state})`)
+          .join(', ')}, which already went out or failed; editing it would post it again. Nothing was ${nothing}.`,
+      };
+    }
+    return { editable: found.map((p) => p.id) };
+  }
+
+  // A public-API save (POST /public/v1/posts body) must not delete posts as
+  // a side effect. Each posts[i] is saved with its own `group`, and the save
+  // soft-deletes every live post of that group it doesn't name. So each item
+  // naming an existing group must name every live post in it (drafts or
+  // queued only), and two items may not share an existing group (the first
+  // save would delete the second's posts)
+  async approvalSaveCheck(
+    orgId: string,
+    body: any,
+    phase: 'request' | 'execute' | 'draft'
+  ): Promise<string | undefined> {
+    const posts: any[] = Array.isArray(body?.posts) ? body.posts : [];
+    const seen = new Set<string>();
+    for (const post of posts) {
+      const group = typeof post?.group === 'string' ? post.group : undefined;
+      const ids = (Array.isArray(post?.value) ? post.value : [])
+        .map((v: any) => v?.id)
+        .filter((id: unknown): id is string => typeof id === 'string' && !!id);
+      if (group) {
+        if (seen.has(group)) {
+          const live = await this._postRepository.getPostIdsInGroup(
+            orgId,
+            group
+          );
+          if (live.length) {
+            return `Two posts in this request use the existing group ${group}; saving the first would delete the second's posts. Send them in one item, or separately. Nothing was ${
+              phase === 'execute' ? 'posted' : phase === 'draft' ? 'saved' : 'filed'
+            }.`;
+          }
+        }
+        seen.add(group);
+      }
+      const edits = await this.approvalEditCheck(orgId, ids, phase, group);
+      if (edits.refuse) {
+        return edits.refuse;
+      }
+    }
+    return undefined;
+  }
+
+  // A stored post as an approval item (a draft about to be scheduled)
+  async approvalItemsOfPost(
+    orgId: string,
+    postId: string
+  ): Promise<ApprovalPostItem[]> {
+    const [root] = await this.getPostsRecursively(postId, false, orgId, true);
+    // only a draft can be scheduled through approval: anything else would
+    // re-queue a post that is queued or already went out
+    return root && root.state === 'DRAFT'
+      ? [
+          {
+            integrationId: root.integrationId,
+            content: root.content,
+            media: root.image,
+          },
+        ]
+      : [];
+  }
+
+  // One id for "these posts", to join an identical request still waiting
+  approvalFingerprint(items: ApprovalPostItem[]) {
+    return items
+      .map((item) => this.approvalFingerprints(item).exact)
+      .sort()
+      .join(',');
+  }
+
+  // Locks held while an approved post runs, so two runs can't both pass the
+  // duplicate check
+  approvalLocks(orgId: string, items: ApprovalPostItem[]) {
+    return [
+      ...new Set(
+        items.map(
+          (item) => `post:${orgId}:${this.approvalFingerprints(item).loose}`
+        )
+      ),
+    ].sort();
+  }
+
+  // The duplicate decision for agent posts (design: mcp-oauth.md, G4 v3).
+  // At request time it informs (refuse an exact copy, warn on a resemblance);
+  // at execution it decides: an exact copy never runs, and a resemblance runs
+  // only if the person was shown it
+  async approvalDuplicateCheck(
+    orgId: string,
+    items: ApprovalPostItem[],
+    phase: 'request' | 'execute',
+    shown: string[] = [],
+    // posts being edited (an update of a queued post must not match itself)
+    excludePostIds: string[] = [],
+    // the group a save goes into (see approvalEditCheck)
+    group?: string
+  ): Promise<{ refuse?: string; warn?: string; shown?: string[] }> {
+    if (!items.length) {
+      return {};
+    }
+
+    // only this org's verified drafts and queued posts are left out of the
+    // duplicate search
+    const edits = await this.approvalEditCheck(
+      orgId,
+      excludePostIds,
+      phase,
+      group
+    );
+    if (edits.refuse) {
+      return { refuse: edits.refuse };
+    }
+    const exclude = edits.editable;
+
+    const since = dayjs().subtract(7, 'day').toDate();
+    const posts = await this._postRepository.getRecentChannelPosts(
+      orgId,
+      [...new Set(items.map((item) => item.integrationId))],
+      since,
+      exclude
+    );
+
+    const describe = (post: (typeof posts)[number]) =>
+      `post ${post.id} on channel ${post.integrationId} (${post.state}, ${dayjs(
+        post.publishDate
+      ).format('YYYY-MM-DD HH:mm')} UTC): "${this.approvalText(
+        post.content,
+        true
+      ).slice(0, 120)}"`;
+
+    const exact: typeof posts = [];
+    const near: typeof posts = [];
+    const duplicateItems = new Set<number>();
+    for (const [index, item] of items.entries()) {
+      const mine = this.approvalFingerprints(item);
+      for (const post of posts.filter(
+        (p) => p.integrationId === item.integrationId
+      )) {
+        const theirs = this.approvalFingerprints({
+          integrationId: post.integrationId,
+          content: post.content,
+          media: post.image,
+        });
+        if (theirs.exact === mine.exact && post.state !== 'ERROR') {
+          exact.push(post);
+          duplicateItems.add(index);
+        } else if (theirs.loose === mine.loose) {
+          near.push(post);
+        }
+      }
+    }
+
+    if (exact.length) {
+      // per post, not per channel: one call may schedule many days on one
+      // channel, and only some of them may be copies
+      const others = items
+        .filter((_, index) => !duplicateItems.has(index))
+        .map((item) => item.label || `channel ${item.integrationId}`);
+      return {
+        refuse: `This exact post already exists: ${exact
+          .map(describe)
+          .join('; ')}. Nothing was ${
+          phase === 'request' ? 'filed' : 'posted'
+        }${
+          others.length
+            ? `; not posted either: ${others.join(', ')} (resend those alone)`
+            : ''
+        }.`,
+      };
+    }
+
+    if (!near.length) {
+      return {};
+    }
+    if (phase === 'request') {
+      return {
+        warn: `⚠ Resembles ${near.map(describe).join('; ')}. Approve only if this is a different post.`,
+        shown: near.map((p) => p.id),
+      };
+    }
+    const unseen = near.filter((p) => !shown.includes(p.id));
+    return unseen.length
+      ? {
+          refuse: `Not posted: it resembles ${unseen
+            .map(describe)
+            .join('; ')}, which the approver was not shown. Nothing was posted.`,
+        }
+      : {};
   }
 
   async getPosts(orgId: string, query: GetPostsDto) {

@@ -8,6 +8,11 @@ import { ModuleRef } from '@nestjs/core';
 import { toolList } from '@gitroom/nestjs-libraries/chat/tools/tool.list';
 import { AgentToolInterface } from '@gitroom/nestjs-libraries/chat/agent.tool.interface';
 import dayjs from 'dayjs';
+import { mcpApproval } from '@gitroom/nestjs-libraries/chat/mcp.approval';
+import { approvalGate } from '@gitroom/nestjs-libraries/chat/human.approval';
+import { runWithContext } from '@gitroom/nestjs-libraries/chat/async.storage';
+import { OrganizationService } from '@gitroom/nestjs-libraries/database/prisma/organizations/organization.service';
+import { RequestContext } from '@mastra/core/di';
 
 export const AgentState = object({
   proverbs: array(string()).default([]),
@@ -34,7 +39,7 @@ export class LoadToolsService {
           .filter((p) => !p.available || p.available())
           .map(async (p) => ({
             name: p.name as string,
-            tool: await p.run(),
+            tool: this.gate(p, await p.run()),
           }))
       )
     ).reduce(
@@ -44,6 +49,80 @@ export class LoadToolsService {
       }),
       {} as Record<string, any>
     );
+  }
+
+  // A tool that declares `approval` asks a human (DharaHIL) over MCP, whatever
+  // it does; the checks the schema makes run before a human is bothered, and
+  // again on args a human edited
+  private gate(p: AgentToolInterface, tool: any) {
+    if (!p.approval) {
+      return tool;
+    }
+    const check = async (args: any) => {
+      const result = await tool.inputSchema?.['~standard']?.validate(args);
+      return result?.issues
+        ? result.issues.map((i: any) => i.message).join('; ')
+        : null;
+    };
+    // args a human edited are refused when the schema can't check them
+    const validate = async (args: any, orgId: string) =>
+      (!tool.inputSchema?.['~standard']?.validate
+        ? 'the arguments cannot be validated'
+        : await check(args)) ||
+      (p.approvalValidate ? p.approvalValidate(args, orgId) : null);
+    // a tool answering with errors did nothing: the claim is released
+    const isNoop = (result: any) => !!result?.output?.errors;
+    const execute = tool.execute;
+
+    const gated = mcpApproval.withApproval({
+      toolName: p.name,
+      approval: (args, orgId) => p.approval!(args, orgId),
+      validate,
+      guard: p.approvalGuard,
+      execute,
+    });
+
+    // Once a person approves, Postiz runs the tool itself (approval sweep),
+    // as the organization that asked, with the same context an MCP call has
+    approvalGate.registerExecutor(p.name, {
+      validate,
+      isNoop,
+      guard: p.approvalGuard,
+      execute: async (orgId, args) => {
+        const org = await this._moduleRef
+          .get(OrganizationService, { strict: false })
+          .getOrgByIdWithSubscription(orgId);
+        if (!org || org.deletedAt) {
+          throw new Error(`Organization ${orgId} not found`);
+        }
+        return runWithContext(
+          { requestId: `approval:${p.name}`, auth: org, surface: 'mcp' },
+          () =>
+            execute(args, {
+              mcp: { extra: { authInfo: org } },
+              requestContext: new RequestContext(),
+            })
+        );
+      },
+    });
+    tool.execute = async (inputData: any, context: any) => {
+      const problem = await check(inputData);
+      if (problem) {
+        throw new Error(`Invalid arguments: ${problem}`);
+      }
+      return gated(inputData, context);
+    };
+    return tool;
+  }
+
+  // Names of the tools a human has to approve; the relay refuses them
+  gatedToolNames() {
+    return toolList
+      .map(
+        (p) => this._moduleRef.get(p, { strict: false }) as AgentToolInterface
+      )
+      .filter((p) => !!p.approval)
+      .map((p) => p.name);
   }
 
   // Tools a self-hosted instance must have to connect through the relay
