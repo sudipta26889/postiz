@@ -1762,6 +1762,7 @@ model OAuthToken {
 
   @@index([authorizationId])
   @@index([familyId])
+  @@index([expiresAt])
 }
 
 model OAuthSelfHostedAuthorization {

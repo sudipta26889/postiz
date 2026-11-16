@@ -49,6 +49,7 @@ const repoWith = (over: any = {}) => ({
   findTokenByHash: jest.fn(async () => null),
   rotateRefresh: jest.fn(async () => true),
   graceReissue: jest.fn(async () => true),
+  revokeFamily: jest.fn(async () => ({ count: 2 })),
   pruneExpiredTokens: jest.fn(async () => ({ count: 0 })),
   revokeFamilyAndGrant: jest.fn(async () => undefined),
   isActiveMember: jest.fn(async () => true),
@@ -143,6 +144,19 @@ describe('refresh rotation for MCP clients', () => {
     expect(res.access_token).toMatch(/^pos_/);
     expect(repo.graceReissue).toHaveBeenCalledWith('tok-r', expect.any(Date), expect.objectContaining({ familyId: 'fam1' }));
     expect(repo.issueTokens).not.toHaveBeenCalled();
+    expect(repo.revokeFamilyAndGrant).not.toHaveBeenCalled();
+  });
+
+  it('a spent refresh token replayed later revokes its family (not the grant)', async () => {
+    const repo = repoWith({
+      findTokenByHash: jest.fn(async () =>
+        refreshRow({ usedAt: new Date(Date.now() - 2_000), revokedAt: new Date() })
+      ),
+    });
+    expect(await errorOf(service(repo).refreshAccessToken('pca_dyn', 'posr_old'))).toMatchObject({
+      body: { error: 'invalid_grant' },
+    });
+    expect(repo.revokeFamily).toHaveBeenCalledWith('fam1');
     expect(repo.revokeFamilyAndGrant).not.toHaveBeenCalled();
   });
 

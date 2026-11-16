@@ -181,6 +181,15 @@ export class OAuthRepository {
     });
   }
 
+  // A refresh token replayed after it was spent: its family ends (not the
+  // grant, which a re-consent may have opened again with a new family)
+  revokeFamily(familyId: string) {
+    return this._oauthToken.model.oAuthToken.updateMany({
+      where: { familyId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+  }
+
   // A replayed refresh token: every token of its family and the grant end
   async revokeFamilyAndGrant(familyId: string, authorizationId: string) {
     await this._transaction.model.$transaction([

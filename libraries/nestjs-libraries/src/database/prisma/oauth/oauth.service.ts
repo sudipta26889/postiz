@@ -721,6 +721,12 @@ export class OAuthService {
     );
     if (old) {
       const grant = old.authorization;
+      // a refresh token already spent (rotated, or its one grace pair taken)
+      // coming back means it leaked: its family ends
+      if (old.kind === 'refresh' && old.revokedAt && old.usedAt) {
+        await this._oauthRepository.revokeFamily(old.familyId);
+        this.invalidGrant();
+      }
       if (
         old.kind !== 'refresh' ||
         grant.oauthAppId !== app.id ||
