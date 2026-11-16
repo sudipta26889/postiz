@@ -66,6 +66,18 @@ type PostWithConditionals = Post & {
 };
 
 // A post item an agent asks to publish, as both MCP and REST describe it
+// A draft saved for approval (design: approval-preview): what the approver
+// previews, and whether approving it schedules it (an item the caller asked
+// to keep as a draft stays one)
+export interface ApprovalStaged {
+  postId: string;
+  hash: string;
+  schedule: boolean;
+  // asked to post now: approving posts it at once; otherwise it keeps its
+  // planned time, and a time already past is never posted on approval
+  now?: boolean;
+}
+
 export interface ApprovalPostItem {
   integrationId: string;
   content: string;
@@ -525,11 +537,111 @@ export class PostsService {
               publishDate: p.publishDate,
               integrationId: p.integrationId,
               state: p.state,
+              delay: (p as any).delay,
             }))
           )
         )
         .digest('hex'),
     };
+  }
+
+  // --- Staged drafts a person approves (design: approval-preview) --------
+  // The public preview page of a post (text, thread, playable media)
+  approvalPreviewLink(postId: string) {
+    return `${process.env.FRONTEND_URL}/p/${postId}?share=true`;
+  }
+
+  // One link per post, named by its channel, for the approval card
+  async approvalLinks(orgId: string, postIds: string[], suffix = '') {
+    const links = [];
+    for (const postId of postIds) {
+      const [root] = await this.getPostsRecursively(postId, true, orgId, true).catch(
+        () => [] as any[]
+      );
+      const channel = root?.integration
+        ? `${root.integration.name} (${root.integration.providerIdentifier})`
+        : `Post ${postId}`;
+      const when = root?.publishDate
+        ? `, planned ${dayjs.utc(root.publishDate).format('YYYY-MM-DD HH:mm')} UTC`
+        : '';
+      links.push({
+        label: `${channel}${when}${suffix}`,
+        url: this.approvalPreviewLink(postId),
+      });
+    }
+    return links;
+  }
+
+  // Ties each staged draft to what the approver previews
+  async approvalStage(
+    orgId: string,
+    roots: { postId: string; schedule: boolean; now?: boolean }[]
+  ): Promise<ApprovalStaged[]> {
+    const staged: ApprovalStaged[] = [];
+    for (const root of roots) {
+      const snapshot = await this.approvalSnapshot(orgId, root.postId);
+      // planned for about now (within 10 minutes of filing): the caller
+      // meant "as soon as approved", so a late approval still posts it
+      const [post] = await this.getPostsRecursively(root.postId, false, orgId, true);
+      const soon =
+        !!post?.publishDate &&
+        dayjs.utc(post.publishDate).isBefore(dayjs.utc().add(10, 'minute'));
+      staged.push({ ...root, now: !!root.now || soon, hash: snapshot.hash });
+    }
+    return staged;
+  }
+
+  // Still exactly what was previewed: every staged post is a draft with the
+  // same content, settings, media and date
+  async approvalStageValid(orgId: string, staged: ApprovalStaged[] = []) {
+    if (!staged.length) {
+      return false;
+    }
+    for (const item of staged) {
+      const snapshot = await this.approvalSnapshot(orgId, item.postId).catch(
+        () => null
+      );
+      if (!snapshot || snapshot.state !== 'DRAFT' || snapshot.hash !== item.hash) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  // The approved run: all of them, or none (the approver saw them together)
+  async approvalScheduleStaged(orgId: string, staged: ApprovalStaged[] = []) {
+    if (!(await this.approvalStageValid(orgId, staged))) {
+      const msg =
+        'The draft changed (or was scheduled, deleted or edited) after it was sent for approval, nothing was scheduled. File the request again so the approver sees the current version.';
+      throw new BadRequestException({ msg, message: msg, nothingDone: true });
+    }
+    // a planned time that passed while waiting: posting it now could put it
+    // out hours late, so nothing is scheduled; the draft stays for a person
+    // to reschedule (5 minutes of grace for the approval itself)
+    for (const item of staged.filter((i) => i.schedule && !i.now)) {
+      const [root] = await this.getPostsRecursively(item.postId, false, orgId, true);
+      if (root?.publishDate && dayjs.utc(root.publishDate).isBefore(dayjs.utc().subtract(5, 'minute'))) {
+        const msg = `The planned time (${dayjs.utc(root.publishDate).format('YYYY-MM-DD HH:mm')} UTC) passed before the approval, so nothing was posted. The post is still a draft in Postiz: set a new time and schedule it there, or file the request again.`;
+        throw new BadRequestException({ msg, message: msg, nothingDone: true });
+      }
+    }
+    const scheduled = [];
+    try {
+      for (const item of staged.filter((i) => i.schedule)) {
+        scheduled.push(await this.changePostStatus(orgId, item.postId, 'schedule'));
+      }
+    } catch (err) {
+      // all of them or none: the ones already scheduled go back to draft
+      for (const done of scheduled) {
+        await this.changePostStatus(orgId, done.id, 'draft').catch(() => null);
+      }
+      throw err;
+    }
+    return scheduled.map((p) => ({
+      postId: p.id,
+      state: p.state,
+      previewUrl: this.approvalPreviewLink(p.id),
+    }));
   }
 
   // --- Duplicates of agent posts a person approves (DharaHIL) -------------

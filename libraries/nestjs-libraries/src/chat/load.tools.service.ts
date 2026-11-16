@@ -106,6 +106,12 @@ export class LoadToolsService {
     // a tool answering with errors did nothing: the claim is released
     const isNoop = (result: any) => !!result?.output?.errors;
     const execute = tool.execute;
+    // approved args carrying staged drafts go to the tool's own runner; the
+    // org is the one the approval was filed for (design: approval-preview)
+    const executeApproved = (orgId: string) => (args: any, context: any) =>
+      Array.isArray(args?.staged) && p.approvalExecute
+        ? p.approvalExecute(args, orgId)
+        : execute(args, context);
 
     const gated = mcpApproval.withApproval({
       toolName: p.name,
@@ -113,6 +119,11 @@ export class LoadToolsService {
       validate,
       guard: p.approvalGuard,
       execute,
+      preview: p.approvalPreview
+        ? (args, orgId, previous) => p.approvalPreview!(args, orgId, previous)
+        : undefined,
+      executeApproved: (args, context, orgId) =>
+        executeApproved(orgId)(args, context),
     });
 
     // Once a person approves, Postiz runs the tool itself (approval sweep),
@@ -131,7 +142,7 @@ export class LoadToolsService {
         return runWithContext(
           { requestId: `approval:${p.name}`, auth: org, surface: 'mcp' },
           () =>
-            execute(args, {
+            executeApproved(orgId)(args, {
               mcp: { extra: { authInfo: org } },
               requestContext: new RequestContext(),
             })
