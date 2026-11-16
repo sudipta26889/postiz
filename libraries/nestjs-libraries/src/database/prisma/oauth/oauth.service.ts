@@ -1335,7 +1335,31 @@ export class OAuthService {
   }
 
   async revokeApp(userId: string, authId: string) {
-    await this._oauthRepository.revokeAuthorization(userId, authId);
-    return { success: true };
+    const { count } = await this._oauthRepository.revokeAuthorization(
+      userId,
+      authId
+    );
+    // its rotating tokens end with it
+    if (count) {
+      await this._oauthRepository.revokeTokensOfAuthorization(authId);
+    }
+    return { success: true, revoked: count > 0 };
   }
+
+  getOrganizationConnections(organizationId: string) {
+    return this._oauthRepository.getOrganizationConnections(organizationId);
+  }
+
+  async revokeOrganizationConnection(organizationId: string, authId: string) {
+    const { count } =
+      await this._oauthRepository.revokeOrganizationConnection(
+        organizationId,
+        authId
+      );
+    if (count) {
+      await this._oauthRepository.revokeTokensOfAuthorization(authId);
+    }
+    return { success: true, revoked: count > 0 };
+  }
+
 }

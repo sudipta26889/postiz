@@ -8,6 +8,7 @@ import { useToaster } from '@gitroom/react/toaster/toaster';
 import { deleteDialog } from '@gitroom/react/helpers/delete.dialog';
 import { useT } from '@gitroom/react/translation/get.transation.service.client';
 import { getTimezone } from '@gitroom/frontend/components/layout/set.timezone';
+import { useUser } from '@gitroom/frontend/components/layout/user.context';
 
 const useApprovedApps = () => {
   const fetch = useFetch();
@@ -21,11 +22,58 @@ const useApprovedApps = () => {
   });
 };
 
+// Every app connected to this organization, by anyone (admins only: the key
+// is null for others, so nothing is fetched)
+const useOrganizationConnections = (isAdmin: boolean) => {
+  const fetch = useFetch();
+  const load = useCallback(async () => {
+    return (await fetch('/user/approved-apps/organization')).json();
+  }, []);
+  return useSWR(isAdmin ? 'organization-connections' : null, load, {
+    revalidateOnFocus: false,
+    revalidateOnReconnect: false,
+    revalidateIfStale: false,
+  });
+};
+
 export const ApprovedAppsComponent: FC = () => {
   const fetch = useFetch();
   const toaster = useToaster();
   const t = useT();
   const { data: apps, mutate } = useApprovedApps();
+  const user = useUser();
+  const isAdmin = user?.role === 'ADMIN' || user?.role === 'SUPERADMIN';
+  const { data: connections, mutate: mutateConnections } =
+    useOrganizationConnections(isAdmin);
+
+  const revokeConnection = useCallback(
+    (connection: any) => async () => {
+      if (
+        await deleteDialog(
+          t(
+            'are_you_sure_revoke_access',
+            `Are you sure you want to revoke access for ${connection.oauthApp?.name}?`,
+            { name: connection.oauthApp?.name }
+          )
+        )
+      ) {
+        try {
+          await fetch(`/user/approved-apps/organization/${connection.id}`, {
+            method: 'DELETE',
+          });
+          toaster.show(
+            t('access_revoked', 'Access revoked successfully'),
+            'success'
+          );
+          mutateConnections();
+          mutate();
+        } catch {
+          toaster.show(t('failed_to_revoke', 'Failed to revoke access'), 'warning');
+        }
+      }
+    },
+    []
+  );
 
   const revokeApp = useCallback(
     (app: any) => async () => {
@@ -117,6 +165,50 @@ export const ApprovedAppsComponent: FC = () => {
           </div>
         )}
       </div>
+      {isAdmin && connections !== undefined && (
+        <>
+          <div className="text-textItemBlur">
+            {t(
+              'apps_connected_to_organization',
+              'Every application connected to this organization, by any member. Revoking ends its access at once.'
+            )}
+          </div>
+          <div className="bg-sixth border-fifth border rounded-[4px] p-[24px]">
+            {!connections?.length ? (
+              <div className="text-textItemBlur">
+                {t('no_organization_connections', 'No connected apps in this organization.')}
+              </div>
+            ) : (
+              <div className="flex flex-col gap-[16px]">
+                {connections.map((connection: any) => (
+                  <div
+                    key={connection.id}
+                    className="flex items-center justify-between p-[12px] border border-fifth rounded-[4px]"
+                  >
+                    <div>
+                      <div className="text-[14px] font-bold">
+                        {connection.oauthApp?.name}
+                      </div>
+                      <div className="text-textItemBlur text-[12px]">
+                        {connection.user?.name || connection.user?.email}
+                        {' · '}
+                        {t('authorized_on', 'Authorized on')}{' '}
+                        {new Date(connection.createdAt).toLocaleDateString(
+                          undefined,
+                          { timeZone: getTimezone() }
+                        )}
+                      </div>
+                    </div>
+                    <Button onClick={revokeConnection(connection)}>
+                      {t('revoke', 'Revoke')}
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </>
+      )}
     </div>
   );
 };

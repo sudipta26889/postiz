@@ -503,35 +503,71 @@ export class OAuthRepository {
     });
   }
 
-  getApprovedApps(userId: string) {
-    return this._oauthAuth.model.oAuthAuthorization.findMany({
-      where: {
-        userId,
-        revokedAt: null,
-        accessToken: { not: null },
-      },
-      include: {
-        oauthApp: {
-          include: {
-            picture: true,
-          },
+  // A live connection: a legacy long-lived token, or a rotating (H2) token
+  // that is still valid. Only the fields the screens show are read: never a
+  // token, a code or an app secret
+  private liveConnectionsWhere(extra: Record<string, unknown>) {
+    return {
+      ...extra,
+      revokedAt: null,
+      OR: [
+        { accessToken: { not: null } },
+        { tokens: { some: { revokedAt: null, expiresAt: { gt: new Date() } } } },
+      ],
+    };
+  }
+
+  private connectionSelect(withUser: boolean) {
+    return {
+      id: true,
+      createdAt: true,
+      oauthApp: {
+        select: {
+          name: true,
+          description: true,
+          picture: { select: { path: true } },
         },
       },
-      orderBy: {
-        createdAt: 'desc',
-      },
+      ...(withUser ? { user: { select: { name: true, email: true } } } : {}),
+    };
+  }
+
+  getApprovedApps(userId: string) {
+    return this._oauthAuth.model.oAuthAuthorization.findMany({
+      where: this.liveConnectionsWhere({ userId }),
+      select: this.connectionSelect(false),
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  // every live connection in an organization, with who made it (admins)
+  getOrganizationConnections(organizationId: string) {
+    return this._oauthAuth.model.oAuthAuthorization.findMany({
+      // made by someone still an active member (removed members' grants
+      // already stop working, see isActiveMember)
+      where: this.liveConnectionsWhere({
+        organizationId,
+        user: {
+          deletedAt: null,
+          organizations: { some: { organizationId, disabled: false } },
+        },
+      }),
+      select: this.connectionSelect(true),
+      orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  revokeOrganizationConnection(organizationId: string, authId: string) {
+    return this._oauthAuth.model.oAuthAuthorization.updateMany({
+      where: { id: authId, organizationId },
+      data: { revokedAt: new Date() },
     });
   }
 
   revokeAuthorization(userId: string, authId: string) {
-    return this._oauthAuth.model.oAuthAuthorization.update({
-      where: {
-        id: authId,
-        userId,
-      },
-      data: {
-        revokedAt: new Date(),
-      },
+    return this._oauthAuth.model.oAuthAuthorization.updateMany({
+      where: { id: authId, userId },
+      data: { revokedAt: new Date() },
     });
   }
 
