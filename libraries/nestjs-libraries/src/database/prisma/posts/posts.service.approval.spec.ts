@@ -190,4 +190,16 @@ describe('approval duplicate decision (PostsService, G4 v3)', () => {
     (service as any).getPostsRecursively = jest.fn(async () => [stored({ state: 'DRAFT' })]);
     expect(await service.approvalItemsOfPost('org1', 'p-old')).toHaveLength(1);
   });
+
+  it('refuses saving a draft over a post that already went out (draft-then-schedule would post it again)', async () => {
+    for (const state of ['PUBLISHED', 'ERROR']) {
+      const { service } = serviceWith([], [{ id: 'p-pub', state }]);
+      const edits = await service.approvalEditCheck('org1', ['p-pub'], 'draft');
+      expect(edits.refuse).toMatch(new RegExp(`edits post p-pub \\(${state}\\).*Nothing was saved`));
+    }
+    const { service } = serviceWith([], [{ id: 'p-q', state: 'QUEUE' }, { id: 'p-d', state: 'DRAFT' }]);
+    expect(await service.approvalEditCheck('org1', ['p-q', 'p-d', 'brand-new'], 'draft')).toEqual({
+      editable: ['p-q', 'p-d'],
+    });
+  });
 });

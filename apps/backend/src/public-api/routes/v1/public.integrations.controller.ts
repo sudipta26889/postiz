@@ -294,6 +294,16 @@ export class PublicIntegrationsController implements OnModuleInit {
     // anything that will be posted needs a human (DharaHIL); drafts don't
     const reason = publishReason([{ type: rawBody?.type }]);
     if (reason === null) {
+      // a draft needs no approval, but it may not turn a post that already
+      // went out back into a draft (which could then be scheduled again)
+      const edits = await this._postsService.approvalEditCheck(
+        org.id,
+        this.editedPostIds(rawBody),
+        'draft'
+      );
+      if (edits.refuse) {
+        throw new HttpException({ msg: edits.refuse }, 400);
+      }
       return this.runCreatePost(org, rawBody);
     }
     return publicApproval.run({

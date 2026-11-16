@@ -583,6 +583,35 @@ export class PostsService {
     };
   }
 
+  // An agent's "edit" may only touch this org's drafts or queued posts.
+  // Editing a published or failed post would turn it back into a draft or a
+  // queued post, and so post it again. Used by every agent path that can
+  // name existing post ids, gated or not (drafts skip approval)
+  async approvalEditCheck(
+    orgId: string,
+    ids: string[],
+    phase: 'request' | 'execute' | 'draft' = 'request'
+  ): Promise<{ refuse?: string; editable: string[] }> {
+    if (!ids.length) {
+      return { editable: [] };
+    }
+    const found = await this._postRepository.getPostStates(orgId, ids);
+    const refused = found.filter(
+      (p) => p.state !== 'DRAFT' && p.state !== 'QUEUE'
+    );
+    if (refused.length) {
+      return {
+        editable: [],
+        refuse: `This edits ${refused
+          .map((p) => `post ${p.id} (${p.state})`)
+          .join(', ')}, which already went out or failed; editing it would post it again. Nothing was ${
+          phase === 'execute' ? 'posted' : phase === 'draft' ? 'saved' : 'filed'
+        }.`,
+      };
+    }
+    return { editable: found.map((p) => p.id) };
+  }
+
   // A stored post as an approval item (a draft about to be scheduled)
   async approvalItemsOfPost(
     orgId: string,
@@ -638,29 +667,13 @@ export class PostsService {
       return {};
     }
 
-    // An "edit" may only touch this org's drafts or queued posts: editing a
-    // published or failed post would queue it and post it again. Only those
-    // checked ids are left out of the duplicate search
-    let exclude: string[] = [];
-    if (excludePostIds.length) {
-      const found = await this._postRepository.getPostStates(
-        orgId,
-        excludePostIds
-      );
-      const refused = found.filter(
-        (p) => p.state !== 'DRAFT' && p.state !== 'QUEUE'
-      );
-      if (refused.length) {
-        return {
-          refuse: `This edits ${refused
-            .map((p) => `post ${p.id} (${p.state})`)
-            .join(', ')}, which already went out or failed; editing it would post it again. Nothing was ${
-            phase === 'request' ? 'filed' : 'posted'
-          }.`,
-        };
-      }
-      exclude = found.map((p) => p.id);
+    // only this org's verified drafts and queued posts are left out of the
+    // duplicate search
+    const edits = await this.approvalEditCheck(orgId, excludePostIds, phase);
+    if (edits.refuse) {
+      return { refuse: edits.refuse };
     }
+    const exclude = edits.editable;
 
     const since = dayjs().subtract(7, 'day').toDate();
     const posts = await this._postRepository.getRecentChannelPosts(
