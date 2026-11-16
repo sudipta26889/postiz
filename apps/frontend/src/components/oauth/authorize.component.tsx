@@ -102,6 +102,14 @@ export const OAuthAuthorize: FC<{ logged: boolean }> = ({ logged }) => {
 
         if (result.redirect) {
           window.location.href = result.redirect;
+        } else {
+          // refused (e.g. a cross-site request): say so instead of spinning
+          setError(
+            result.error_description ||
+              result.message ||
+              'Authorization refused'
+          );
+          setSubmitting(false);
         }
       } catch {
         setError('Failed to process authorization');

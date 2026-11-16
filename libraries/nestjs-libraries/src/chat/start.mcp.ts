@@ -59,6 +59,8 @@ const originOf = (value?: string) => {
 const allowedMcpOrigins = [
   'https://claude.ai',
   'https://chatgpt.com',
+  // MCP Inspector in direct mode, as the backend CORS allow-list already has
+  'http://localhost:6274',
   originOf(process.env.FRONTEND_URL),
   originOf(process.env.MCP_URL),
   ...(process.env.MCP_ALLOWED_ORIGINS || '')
@@ -69,6 +71,7 @@ const allowedMcpOrigins = [
 // Every protocol version the MCP clients we serve send (the server itself
 // negotiates 2026-07-28)
 const supportedMcpProtocolVersions = [
+  '2024-10-07',
   '2024-11-05',
   '2025-03-26',
   '2025-06-18',
