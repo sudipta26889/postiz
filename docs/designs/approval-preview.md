@@ -75,3 +75,22 @@ Otherwise it stages again. Joining an identical waiting request stages nothing.
 5. Production: from claude.ai, scheduling a post creates a DharaHIL request whose card shows a working preview
    link (it opens the draft, with media), and nothing is queued. The owner rejects it, and the draft stays a
    draft.
+
+## Live findings (2026-11-16, production)
+
+- **DharaHIL `metadata` values must be strings** (otherwise 422). `staged` is sent as `'true'` (PR #12).
+- **DharaHIL rebuilds the shown copy from `tool_args`** (`server_redaction`), so the `preview_N` link keys ride in
+  the filed args (PR #13). The edit check ignores `staged` and `preview_N`.
+- **DharaHIL masks every 20+ character letter/digit run.** Postiz post ids are 25 characters, so the web inbox's url
+  field shows `/p/***REDACTED***`. The full link is in `context_summary` (not redacted), which Slack and Telegram
+  turn into links.
+  - Fix owned by DharaHIL, via GuardianAI: exempt declared `type: "url"` fields for admin-registered origins (for
+    Postiz: `https://postiz.sudiptadhara.in`).
+- **Verified:**
+  - a gated schedule saves a DRAFT;
+  - the card shows "<channel> (<provider>), planned <time> UTC" with the link;
+  - the link opens the draft;
+  - a Slack approval scheduled exactly that draft;
+  - an invalid post (X without `who_can_reply_post`) is refused before anything is created.
+- **Test hygiene:** the owner may approve test requests from Slack. The lead deletes its own test posts right after
+  each live check.
