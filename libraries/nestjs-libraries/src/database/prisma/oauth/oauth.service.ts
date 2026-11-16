@@ -368,19 +368,18 @@ export class OAuthService {
       }
     }
 
+    // Every MCP client (dynamic registration) and every public client must
+    // use PKCE with S256 (OAuth 2.1, MCP auth spec): a confidential dynamic
+    // client is no exception, and a missing method means "plain" (RFC 7636)
     const isPublicClient = this.isPublicClient(app);
     if (app.dynamic || isPublicClient) {
-      if (isPublicClient && !options?.codeChallenge) {
+      if (!options?.codeChallenge) {
         throw new HttpException(
           'code_challenge is required for this client',
           HttpStatus.BAD_REQUEST
         );
       }
-      if (
-        options?.codeChallenge &&
-        options?.codeChallengeMethod &&
-        options.codeChallengeMethod !== 'S256'
-      ) {
+      if (options.codeChallengeMethod !== 'S256') {
         throw new HttpException(
           'Only the S256 code_challenge_method is supported',
           HttpStatus.BAD_REQUEST
@@ -767,7 +766,21 @@ export class OAuthService {
 
   async getOrgByOAuthToken(token: string) {
     const encrypted = AuthService.fixedEncryption(token);
-    return this._oauthRepository.findByAccessToken(encrypted);
+    const authorization = await this._oauthRepository.findByAccessToken(
+      encrypted
+    );
+    // re-checked on every use: removing someone from the organization cuts
+    // off every OAuth client they connected
+    if (
+      !authorization ||
+      !(await this._oauthRepository.isActiveMember(
+        authorization.userId,
+        authorization.organizationId
+      ))
+    ) {
+      return null;
+    }
+    return authorization;
   }
 
   async getUserInfo(authorization?: string) {

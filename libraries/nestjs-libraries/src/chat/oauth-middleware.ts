@@ -45,6 +45,8 @@ export function createOAuthMiddleware(options: OAuthMiddlewareOptions) {
     wellKnownPath + (resourcePath === '/' ? '' : resourcePath),
     oauth.resource,
   ).toString();
+  // scope= in the challenge tells a client which scopes to ask for (MCP auth spec)
+  const scope = (protectedResourceMetadata.scopes_supported ?? []).join(' ');
 
   return async function oauthMiddleware(
     req: http.IncomingMessage,
@@ -90,7 +92,10 @@ export function createOAuthMiddleware(options: OAuthMiddlewareOptions) {
       logger?.debug?.('OAuth middleware: No bearer token provided');
       res.writeHead(401, {
         'Content-Type': 'application/json',
-        'WWW-Authenticate': generateWWWAuthenticateHeader({ resourceMetadataUrl }),
+        'WWW-Authenticate': generateWWWAuthenticateHeader({
+          resourceMetadataUrl,
+          additionalParams: { scope },
+        }),
       });
       res.end(
         JSON.stringify({
@@ -113,6 +118,7 @@ export function createOAuthMiddleware(options: OAuthMiddlewareOptions) {
           'WWW-Authenticate': generateWWWAuthenticateHeader({
             resourceMetadataUrl,
             additionalParams: {
+              scope,
               error: validationResult.error || 'invalid_token',
               ...(validationResult.errorDescription && {
                 error_description: validationResult.errorDescription,

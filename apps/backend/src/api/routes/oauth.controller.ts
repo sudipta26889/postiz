@@ -30,6 +30,28 @@ import { extractBasicCredentials } from '@gitroom/nestjs-libraries/chat/oauth-ty
 import { McpRelayService } from '@gitroom/nestjs-libraries/chat/mcp.relay.service';
 import { ThrottlerRealIpGuard } from '@gitroom/nestjs-libraries/throttler/throttler.provider';
 
+// The origins the frontend is served from (the CORS allow-list's own)
+const isFrontendOrigin = (value?: string) => {
+  if (!value) {
+    return false;
+  }
+  let candidate: string;
+  try {
+    candidate = new URL(value).origin;
+  } catch {
+    return false;
+  }
+  return [process.env.FRONTEND_URL, process.env.MAIN_URL]
+    .filter(Boolean)
+    .some((allowed) => {
+      try {
+        return new URL(allowed!).origin === candidate;
+      } catch {
+        return false;
+      }
+    });
+};
+
 @ApiTags('OAuth')
 @Controller('/oauth')
 export class OAuthController {
@@ -128,8 +150,14 @@ export class OAuthController {
   @HttpCode(200)
   async token(
     @Body() body: TokenExchangeDto,
+    @Res({ passthrough: true }) res: Response,
     @Headers('authorization') authorization?: string
   ) {
+    // RFC 6749 §5.1: token responses must not be cached, errors included;
+    // set before anything can throw so the exception filter keeps them
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Pragma', 'no-cache');
+
     // client_secret_basic puts the credentials in the Authorization header,
     // client_secret_post and public clients put them in the body
     const basic = extractBasicCredentials(authorization);
@@ -207,8 +235,20 @@ export class OAuthAuthorizedController {
   async approveOrDeny(
     @Body() body: ApproveOAuthDto,
     @GetUserFromRequest() user: User,
-    @GetOrgFromRequest() org: Organization
+    @GetOrgFromRequest() org: Organization,
+    @Headers('origin') origin?: string,
+    @Headers('referer') referer?: string
   ) {
+    // The session cookie alone authenticates this call, so a page on another
+    // site could post it (CSRF) and approve a client in the user's name: only
+    // the app's own frontend may approve or deny
+    if (!isFrontendOrigin(origin || referer)) {
+      throw new HttpException(
+        { error: 'invalid_request', error_description: 'Cross-site request refused' },
+        HttpStatus.FORBIDDEN
+      );
+    }
+
     const app = await this._oauthService.validateAuthorizationRequest(
       body.client_id,
       {

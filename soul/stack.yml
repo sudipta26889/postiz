@@ -45,6 +45,7 @@ x-env: &env
   # Public MCP base (no /api): the edge routes /mcp-oauth*, /mcp, /sse, /message and the
   # OAuth discovery documents to the backend, so the UI shows URLs that connect
   MCP_URL: ${MCP_URL:-https://postiz.sudiptadhara.in}
+  MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
   NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-}
   NEXT_PUBLIC_DISCORD_SUPPORT: ${NEXT_PUBLIC_DISCORD_SUPPORT:-}
   NEXT_PUBLIC_POLOTNO: ${NEXT_PUBLIC_POLOTNO:-}

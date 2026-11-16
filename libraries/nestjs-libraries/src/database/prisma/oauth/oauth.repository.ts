@@ -6,8 +6,25 @@ export class OAuthRepository {
   constructor(
     private _oauthApp: PrismaRepository<'oAuthApp'>,
     private _oauthAuth: PrismaRepository<'oAuthAuthorization'>,
-    private _oauthSelfHosted: PrismaRepository<'oAuthSelfHostedAuthorization'>
+    private _oauthSelfHosted: PrismaRepository<'oAuthSelfHostedAuthorization'>,
+    private _userOrganization: PrismaRepository<'userOrganization'>
   ) {}
+
+  // Whether the user who granted access still belongs to the organization:
+  // a removed or disabled member, a deleted user or a deleted organization
+  // ends every OAuth grant they made
+  async isActiveMember(userId: string, organizationId: string) {
+    return !!(await this._userOrganization.model.userOrganization.findFirst({
+      where: {
+        userId,
+        organizationId,
+        disabled: false,
+        user: { deletedAt: null, activated: true },
+        organization: { deletedAt: null },
+      },
+      select: { id: true },
+    }));
+  }
 
   getAppByOrgId(orgId: string) {
     return this._oauthApp.model.oAuthApp.findFirst({
