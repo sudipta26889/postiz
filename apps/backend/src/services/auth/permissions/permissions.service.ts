@@ -52,6 +52,14 @@ export class PermissionsService {
       !process.env.STRIPE_PUBLISHABLE_KEY
     ) {
       for (const [action, section] of requestedPermission) {
+        // without billing every limit is lifted, but admin-only actions are
+        // a matter of role, not of plan: they stay admin-only
+        if (
+          section === Sections.ADMIN &&
+          !['ADMIN', 'SUPERADMIN'].includes(permission)
+        ) {
+          continue;
+        }
         can(action, section);
       }
       return build({
