@@ -65,7 +65,7 @@ async function start() {
     cors: (req: any, callback: (err: Error | null, options?: any) => void) =>
       callback(
         null,
-        /^\/oauth\/(token|register)\/?(\?|$)/.test(req.url || '')
+        /^\/oauth\/(token|register|revoke)\/?(\?|$)/.test(req.url || '')
           ? {
               origin: '*',
               credentials: false,
@@ -77,7 +77,7 @@ async function start() {
 
   // RFC 6749 5.1: no token response may be cached. Set before validation,
   // so a 400 from the body validation carries it too
-  app.use('/oauth/token', (req: any, res: any, next: () => void) => {
+  app.use(['/oauth/token', '/oauth/revoke'], (req: any, res: any, next: () => void) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Pragma', 'no-cache');
     next();

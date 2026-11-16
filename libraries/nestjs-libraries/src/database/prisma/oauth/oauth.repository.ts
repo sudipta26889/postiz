@@ -427,6 +427,15 @@ export class OAuthRepository {
     });
   }
 
+  // RFC 7009 revocation of a legacy (long-lived) token: its grant ends
+  revokeAuthorizationById(id: string) {
+    return this._oauthAuth.model.oAuthAuthorization.update({
+      where: { id },
+      data: { revokedAt: new Date() },
+      select: { id: true },
+    });
+  }
+
   // after a legacy (long-lived) token moved to a rotating family it stops
   clearLegacyAccessToken(id: string) {
     return this._oauthAuth.model.oAuthAuthorization.update({

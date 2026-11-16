@@ -24,6 +24,7 @@ import {
   AuthorizeSelfHostedDto,
 } from '@gitroom/nestjs-libraries/dtos/oauth/authorize-oauth.dto';
 import { TokenExchangeDto } from '@gitroom/nestjs-libraries/dtos/oauth/token-exchange.dto';
+import { RevokeTokenDto } from '@gitroom/nestjs-libraries/dtos/oauth/revoke-token.dto';
 import { RegisterClientDto } from '@gitroom/nestjs-libraries/dtos/oauth/register-client.dto';
 import { HubspotInstallQueryDto } from '@gitroom/nestjs-libraries/dtos/oauth/hubspot-install.dto';
 import { extractBasicCredentials } from '@gitroom/nestjs-libraries/chat/oauth-types';
@@ -146,6 +147,10 @@ export class OAuthController {
   }
 
   @Post('/token')
+  // stops guessing a client secret; generous enough for clients refreshing
+  // from shared servers (claude.ai, ChatGPT)
+  @UseGuards(ThrottlerRealIpGuard)
+  @Throttle({ default: { limit: 120, ttl: 60000 } })
   // RFC 6749 §5.1: successful token responses are 200; strict clients (Canva) reject Nest's default 201
   @HttpCode(200)
   async token(
@@ -190,6 +195,26 @@ export class OAuthController {
       body.redirect_uri,
       body.resource
     );
+  }
+
+  // RFC 7009: always 200 for an authenticated client, whatever the token
+  @Post('/revoke')
+  // stops guessing a client secret; generous enough for clients refreshing
+  // from shared servers (claude.ai, ChatGPT)
+  @UseGuards(ThrottlerRealIpGuard)
+  @Throttle({ default: { limit: 120, ttl: 60000 } })
+  @HttpCode(200)
+  async revoke(
+    @Body() body: RevokeTokenDto,
+    @Headers('authorization') authorization?: string
+  ) {
+    const basic = extractBasicCredentials(authorization);
+    await this._oauthService.revokeToken(
+      basic?.clientId || body.client_id,
+      basic?.clientSecret || body.client_secret,
+      body.token
+    );
+    return {};
   }
 
   @Get('/userinfo')

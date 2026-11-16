@@ -6,7 +6,7 @@ import { RegisterClientDto } from '@gitroom/nestjs-libraries/dtos/oauth/register
 import { makeSecureId } from '@gitroom/nestjs-libraries/services/make.secure.id';
 import { AuthService } from '@gitroom/helpers/auth/auth.service';
 import { extractBearerToken } from '@gitroom/nestjs-libraries/chat/oauth-types';
-import { createHash } from 'crypto';
+import { createHash, timingSafeEqual } from 'crypto';
 import { OAuthApp } from '@prisma/client';
 import type { SelfHostedInstance } from '@gitroom/nestjs-libraries/chat/mcp.relay.service';
 
@@ -527,9 +527,7 @@ export class OAuthService {
 
     if (!this.isPublicClient(app)) {
       if (
-        !clientSecret ||
-        !app.clientSecret ||
-        app.clientSecret !== AuthService.fixedEncryption(clientSecret)
+        !this.secretMatches(app, clientSecret)
       ) {
         throw new HttpException(
           { error: 'invalid_client' },
@@ -685,6 +683,20 @@ export class OAuthService {
   // tokens never expire, so the refresh token is the access token itself:
   // refreshing hands it back unchanged, and it stops working exactly when the
   // access token does. No other client gets these fields
+  // A confidential client's secret, compared in constant time so the time
+  // taken says nothing about how much of a guess was right
+  private secretMatches(
+    app: Pick<OAuthApp, 'clientSecret'>,
+    clientSecret?: string
+  ) {
+    if (!clientSecret || !app.clientSecret) {
+      return false;
+    }
+    const expected = Buffer.from(app.clientSecret);
+    const given = Buffer.from(AuthService.fixedEncryption(clientSecret));
+    return expected.length === given.length && timingSafeEqual(expected, given);
+  }
+
   private invalidGrant(): never {
     throw new HttpException({ error: 'invalid_grant' }, HttpStatus.BAD_REQUEST);
   }
@@ -700,9 +712,7 @@ export class OAuthService {
   ) {
     if (
       !this.isPublicClient(app) &&
-      (!clientSecret ||
-        !app.clientSecret ||
-        app.clientSecret !== AuthService.fixedEncryption(clientSecret))
+      !this.secretMatches(app, clientSecret)
     ) {
       throw new HttpException(
         { error: 'invalid_client' },
@@ -796,6 +806,46 @@ export class OAuthService {
     await this._oauthRepository.issueTokens(tokens);
     await this._oauthRepository.clearLegacyAccessToken(legacy.id);
     return response;
+  }
+
+  // RFC 7009: a client revokes one of its own tokens. The client
+  // authenticates like at /token; whatever the token is (unknown, expired,
+  // someone else's), the answer is the same 200, so nothing leaks. A rotating
+  // token ends its family, a legacy long-lived one its grant
+  async revokeToken(clientId?: string, clientSecret?: string, token?: string) {
+    const app = clientId
+      ? await this._oauthRepository.getAppByClientId(clientId)
+      : null;
+    if (
+      !app ||
+      (!this.isPublicClient(app) &&
+        !this.secretMatches(app, clientSecret))
+    ) {
+      throw new HttpException(
+        { error: 'invalid_client' },
+        HttpStatus.UNAUTHORIZED
+      );
+    }
+    if (!token) {
+      return;
+    }
+
+    const rotating = await this._oauthRepository.findTokenByHash(
+      hashToken(token)
+    );
+    if (rotating) {
+      if (rotating.authorization.oauthAppId === app.id) {
+        await this._oauthRepository.revokeFamily(rotating.familyId);
+      }
+      return;
+    }
+
+    const legacy = await this._oauthRepository.findByAccessToken(
+      AuthService.fixedEncryption(token)
+    );
+    if (legacy && legacy.oauthAppId === app.id) {
+      await this._oauthRepository.revokeAuthorizationById(legacy.id);
+    }
   }
 
   // RFC 8707: a token is bound to the MCP resource it was asked for; any
