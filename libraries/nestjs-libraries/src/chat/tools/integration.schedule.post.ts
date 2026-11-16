@@ -277,10 +277,10 @@ export class IntegrationSchedulePostTool implements AgentToolInterface {
       return previous;
     }
     const result: any = await this.createPosts(args, orgId, true);
-    // a validation error: nothing was saved, file nothing staged (the gate
-    // then refuses it the same way the real call would)
+    // a validation error: nothing was saved and nothing is filed, the caller
+    // gets the same error the real call gives
     if (!Array.isArray(result?.output)) {
-      return null;
+      throw new Error(result?.output?.errors || 'The post is not valid, nothing was filed');
     }
     const staged = await this._postsService.approvalStage(
       orgId,

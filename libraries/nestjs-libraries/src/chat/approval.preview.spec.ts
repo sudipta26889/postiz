@@ -1,4 +1,4 @@
-import { createApprovalGate } from '@gitroom/nestjs-libraries/chat/human.approval';
+import { approvalKey, createApprovalGate } from '@gitroom/nestjs-libraries/chat/human.approval';
 
 // design: docs/designs/approval-preview.md
 const expiresAt = new Date(Date.now() + 3600_000).toISOString();
@@ -120,5 +120,60 @@ describe('approval preview: the approver opens the real post', () => {
     expect(data.get('hil:exec:req1')).toBeUndefined();
     const report = sent.find((s) => s.url.endsWith('/v1/requests/req1/executed'));
     expect(JSON.stringify(report?.body)).toContain('nothing was done');
+  });
+
+  it('a staged request never runs raw args, even from a caller that joined it', async () => {
+    const approved = json({
+      status: 'APPROVED',
+      last_decision_by: { email: 'owner@example.test' },
+      version: 2,
+      metadata: { org: 'org1', tool: 'public.posts.create', staged: true },
+    });
+    // a differently worded caller mapped to the request; its pending entry
+    // and the staging are gone (another key, or expired)
+    const { gate, data } = setup([approved]);
+    const execute = jest.fn();
+    const other = { ...input(execute), args: { type: 'schedule', posts: [{ text: 'hi there' }] } };
+    data.set(`hil:req:${approvalKey('org1', 'public.posts.create', other.args)}`, 'req9');
+
+    const result: any = await gate.decide(other);
+    expect(result.status).toBe('refused');
+    expect(result.message).toContain('could not be found');
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('an edit made in DharaHIL to a staged request is refused, not silently dropped', async () => {
+    const edited = json({
+      status: 'APPROVED',
+      last_decision_by: { email: 'owner@example.test' },
+      version: 2,
+      metadata: { org: 'org1', tool: 'public.posts.create', staged: true },
+      approved_args: { type: 'schedule', posts: [{ text: 'edited by the approver' }], staged },
+    });
+    const { gate } = setup([created, edited]);
+    const execute = jest.fn();
+    await gate.decide(input(execute));
+    const result: any = await gate.decide(input(execute));
+    expect(result.message).toContain('edited in DharaHIL');
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it('two identical calls at the same moment stage only once', async () => {
+    const { gate } = setup([created]);
+    let release: () => void = () => undefined;
+    const slow = jest.fn(
+      (args: any) =>
+        new Promise<any>((resolve) => {
+          release = () => resolve({ args: { ...args, staged }, links: [] });
+        })
+    );
+    const first = gate.decide({ ...input(), preview: slow });
+    await new Promise((r) => setTimeout(r, 0));
+    const second: any = await gate.decide({ ...input(), preview: slow });
+    release();
+    await first;
+    expect(second.status).toBe('refused');
+    expect(second.message).toContain('being filed right now');
+    expect(slow).toHaveBeenCalledTimes(1);
   });
 });

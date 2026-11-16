@@ -191,6 +191,7 @@ export class PublicIntegrationsController implements OnModuleInit {
       return {
         args,
         links: await this._postsService.approvalLinks(org.id, existing, ', as it is now'),
+        heading: 'The post as it is now (the change is in the request)',
       };
     }
     if (
@@ -229,6 +230,7 @@ export class PublicIntegrationsController implements OnModuleInit {
               [args.id],
               ', as it is now'
             ),
+            heading: 'The post as it is now',
           }
         : null;
 

@@ -90,6 +90,9 @@ export interface DecideInput<T> {
 export interface ApprovalPreview {
   args: any;
   links: { label: string; url: string }[];
+  // what the links show: the staged post itself, or an existing post as it
+  // is now (a delete, an edit)
+  heading?: string;
 }
 
 // How an action protects against duplicates (design: G4 v3). The decision
@@ -632,11 +635,31 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     // what runs is what the person approved: their edits, or else the args
     // stored when the request was filed, never a later caller's
     const stored = await pendingItem(requestId);
-    const args =
-      data.approved_args ??
-      stored?.args ??
-      (await stagedPreview(key))?.args ??
-      input.args;
+    // what was filed: kept here, by DharaHIL, or with the staging
+    const filed =
+      stored?.args ?? data.tool_args ?? (await stagedPreview(key))?.args;
+    let args = data.approved_args ?? filed ?? input.args;
+    // a request filed with staged drafts only ever schedules those drafts
+    // (design: approval-preview): never another caller's raw args, and never
+    // args a person edited in DharaHIL (the draft is what they previewed)
+    if (data.metadata?.staged) {
+      const without = (a: any) => {
+        const { staged: _s, ...rest } = a || {};
+        return canonicalJson(rest);
+      };
+      const problem = !Array.isArray(filed?.staged)
+        ? 'the drafts it was filed with could not be found, nothing was done'
+        : data.approved_args && without(data.approved_args) !== without(filed)
+        ? 'it was edited in DharaHIL, and edits are not applied to a previewed draft: edit the draft in Postiz and file the request again'
+        : null;
+      if (problem) {
+        const message = `Approval request ${requestId} was not carried out: ${problem}`;
+        await notApproved(cfg, requestId, data.version ?? 1, input.org, message, 'invalid-args');
+        return { status: 'refused', message };
+      }
+      args = filed;
+    }
+
     if (input.validate) {
       const problem = await input.validate(args, input.org);
       if (problem) {
@@ -740,22 +763,38 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     // identical call reuses it and the approved run finds it
     let filed = input.args;
     let links: ApprovalPreview['links'] = [];
+    let heading = 'Preview (exactly what will be posted)';
     if (input.preview) {
-      const preview = await input.preview(
-        input.args,
-        input.org,
-        await stagedPreview(key)
-      );
-      if (preview) {
-        filed = preview.args;
-        links = preview.links;
-        await deps.redis.set(stageKey(key), JSON.stringify(preview), 'EX', approvedTtl);
+      // two identical calls at the same moment: only one stages (and files)
+      const lock = `${stageKey(key)}:lock`;
+      if (!(await deps.redis.set(lock, '1', 'EX', 120, 'NX'))) {
+        return {
+          status: 'refused',
+          message:
+            'An identical request is being filed right now. Call again in a minute to get its status; nothing new was filed.',
+        };
+      }
+      try {
+        const preview = await input.preview(
+          input.args,
+          input.org,
+          await stagedPreview(key)
+        );
+        if (preview) {
+          filed = preview.args;
+          links = preview.links;
+          heading = preview.heading || heading;
+          await deps.redis.set(stageKey(key), JSON.stringify(preview), 'EX', approvedTtl);
+        }
+      } finally {
+        await deps.redis.del(lock);
       }
     }
     if (links.length) {
-      reason = `${reason}\n\nPreview (exactly what will be posted):\n${links
-        .map((l) => `${l.label}: ${l.url}`)
-        .join('\n')}`;
+      const list = links.map((l) => `${l.label}: ${l.url}`);
+      reason = `${reason}\n\n${heading}:\n${list.slice(0, 30).join('\n')}${
+        list.length > 30 ? `\n(and ${list.length - 30} more)` : ''
+      }`;
     }
     const linkFields = Object.fromEntries(
       links.map((l, i) => [`preview_${i + 1}`, l.url])
@@ -775,7 +814,7 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
             display_hints: {
               sections: [
                 {
-                  label: 'Preview (exactly what will be posted)',
+                  label: heading,
                   fields: links.map((l, i) => ({
                     key: `preview_${i + 1}`,
                     label: l.label,
@@ -795,6 +834,8 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
         org: input.org,
         tool: input.action,
         ...(typeof input.args?.id === 'string' ? { post_id: input.args.id } : {}),
+        // its approval may only ever schedule these drafts (see read())
+        ...(Array.isArray(filed?.staged) ? { staged: true } : {}),
       },
       webhook: { url: '', headers: {}, decision_url: `${cfg.baseUrl}/v1/requests` },
     });

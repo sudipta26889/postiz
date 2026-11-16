@@ -537,6 +537,7 @@ export class PostsService {
               publishDate: p.publishDate,
               integrationId: p.integrationId,
               state: p.state,
+              delay: (p as any).delay,
             }))
           )
         )
@@ -574,12 +575,18 @@ export class PostsService {
   // Ties each staged draft to what the approver previews
   async approvalStage(
     orgId: string,
-    roots: { postId: string; schedule: boolean }[]
+    roots: { postId: string; schedule: boolean; now?: boolean }[]
   ): Promise<ApprovalStaged[]> {
     const staged: ApprovalStaged[] = [];
     for (const root of roots) {
       const snapshot = await this.approvalSnapshot(orgId, root.postId);
-      staged.push({ ...root, hash: snapshot.hash });
+      // planned for about now (within 10 minutes of filing): the caller
+      // meant "as soon as approved", so a late approval still posts it
+      const [post] = await this.getPostsRecursively(root.postId, false, orgId, true);
+      const soon =
+        !!post?.publishDate &&
+        dayjs.utc(post.publishDate).isBefore(dayjs.utc().add(10, 'minute'));
+      staged.push({ ...root, now: !!root.now || soon, hash: snapshot.hash });
     }
     return staged;
   }
@@ -619,8 +626,16 @@ export class PostsService {
       }
     }
     const scheduled = [];
-    for (const item of staged.filter((i) => i.schedule)) {
-      scheduled.push(await this.changePostStatus(orgId, item.postId, 'schedule'));
+    try {
+      for (const item of staged.filter((i) => i.schedule)) {
+        scheduled.push(await this.changePostStatus(orgId, item.postId, 'schedule'));
+      }
+    } catch (err) {
+      // all of them or none: the ones already scheduled go back to draft
+      for (const done of scheduled) {
+        await this.changePostStatus(orgId, done.id, 'draft').catch(() => null);
+      }
+      throw err;
     }
     return scheduled.map((p) => ({
       postId: p.id,
