@@ -2,7 +2,7 @@ import {
   approvalKey,
   canonicalJson,
   createApprovalGate,
-  publishNowReason,
+  publishReason,
 } from '@gitroom/nestjs-libraries/chat/human.approval';
 
 const expiresAt = new Date(Date.now() + 3600_000).toISOString();
@@ -144,22 +144,21 @@ describe('decide returns a transport-neutral decision', () => {
   });
 });
 
-describe('publishNowReason (shared trigger rule)', () => {
-  const now = Date.parse('2026-11-16T12:00:00Z');
-  const at = (m: number) => new Date(now + m * 60_000).toISOString();
-
-  it('gates now, a past date, within 5 minutes, and unparseable dates', () => {
-    expect(publishNowReason([{ type: 'now', date: at(60) }], now)).toBeTruthy();
-    for (const m of [-60, 0, 5]) {
-      expect(publishNowReason([{ type: 'schedule', date: at(m) }], now)).toBeTruthy();
-    }
-    expect(publishNowReason([{ type: 'schedule', date: 'soon' }], now)).toBeTruthy();
-    expect(publishNowReason([{ type: 'schedule' }], now)).toBeTruthy();
+describe('publishReason (shared trigger rule)', () => {
+  it('gates anything that will be posted: now, scheduled near or far, unknown type', () => {
+    expect(publishReason([{ type: 'now' }])).toBeTruthy();
+    expect(publishReason([{ type: 'schedule' }])).toBeTruthy();
+    expect(publishReason([{ type: 'update' }])).toBeTruthy();
+    expect(publishReason([{}])).toBeTruthy();
+    expect(publishReason([{ type: 'draft' }, { type: 'schedule' }])).toBeTruthy();
   });
 
-  it('lets a future date and drafts through', () => {
-    expect(publishNowReason([{ type: 'schedule', date: at(6) }], now)).toBeNull();
-    expect(publishNowReason([{ type: 'draft', date: at(-60) }], now)).toBeNull();
-    expect(publishNowReason(undefined, now)).toBeNull();
+  it('fails closed on a missing or empty list', () => {
+    expect(publishReason(undefined)).toBeTruthy();
+    expect(publishReason([])).toBeTruthy();
+  });
+
+  it('lets only drafts through', () => {
+    expect(publishReason([{ type: 'draft' }, { type: 'draft' }])).toBeNull();
   });
 });

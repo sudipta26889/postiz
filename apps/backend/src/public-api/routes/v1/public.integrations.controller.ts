@@ -42,7 +42,7 @@ import { ClippingService } from '@gitroom/nestjs-libraries/database/prisma/clipp
 import { NotificationService } from '@gitroom/nestjs-libraries/database/prisma/notifications/notification.service';
 import { GetNotificationsDto } from '@gitroom/nestjs-libraries/dtos/notifications/get.notifications.dto';
 import * as Sentry from '@sentry/nestjs';
-import { publishNowReason } from '@gitroom/nestjs-libraries/chat/human.approval';
+import { publishReason } from '@gitroom/nestjs-libraries/chat/human.approval';
 import { publicApproval } from '@gitroom/nestjs-libraries/chat/public.approval';
 import {
   socialIntegrationList,
@@ -153,10 +153,8 @@ export class PublicIntegrationsController {
     @Body() rawBody: any
   ) {
     Sentry.metrics.count('public_api-request', 1);
-    // publishing now needs a human (DharaHIL); drafts and future dates don't
-    const reason = publishNowReason([
-      { type: rawBody?.type, date: rawBody?.date },
-    ]);
+    // anything that will be posted needs a human (DharaHIL); drafts don't
+    const reason = publishReason([{ type: rawBody?.type }]);
     if (reason === null) {
       return this.runCreatePost(org, rawBody);
     }
@@ -712,7 +710,18 @@ export class PublicIntegrationsController {
     @Body() body: ChangePostStatusDto
   ) {
     Sentry.metrics.count('public_api-request', 1);
-    return this._postsService.changePostStatus(org.id, id, body.status);
+    // moving a draft to 'schedule' posts it: a human approves that (DharaHIL)
+    if (body?.status === 'draft') {
+      return this._postsService.changePostStatus(org.id, id, body.status);
+    }
+    return publicApproval.run({
+      action: 'public.posts.status',
+      org: org.id,
+      args: { id, status: body?.status },
+      reason: 'Scheduling a draft to be posted',
+      execute: (args) =>
+        this._postsService.changePostStatus(org.id, args.id, args.status),
+    });
   }
 
   @Put('/posts/:id/release-id')

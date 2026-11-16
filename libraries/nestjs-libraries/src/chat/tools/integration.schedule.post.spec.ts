@@ -15,55 +15,31 @@ jest.mock(
 
 import { scheduleApproval } from '@gitroom/nestjs-libraries/chat/tools/integration.schedule.post';
 
-const now = Date.parse('2026-11-16T12:00:00Z');
-const at = (minutes: number) => new Date(now + minutes * 60_000).toISOString();
 const post = (type: string, date: string) => ({ type, date });
+const inAWeek = new Date(Date.now() + 7 * 24 * 3600_000).toISOString();
 
 describe('schedule post approval trigger', () => {
   it('gates publish-now', () => {
-    expect(scheduleApproval({ socialPost: [post('now', at(0))] }, now)).toEqual(
+    expect(scheduleApproval({ socialPost: [post('now', inAWeek)] })).toEqual(
       expect.any(String)
     );
   });
 
-  it('gates a scheduled post in the past or within 5 minutes', () => {
-    for (const minutes of [-60, 0, 4, 5]) {
-      expect(
-        scheduleApproval({ socialPost: [post('schedule', at(minutes))] }, now)
-      ).toEqual(expect.any(String));
-    }
-  });
-
-  it('gates a date that does not parse', () => {
+  it('gates a post scheduled far in the future too (nothing is posted without a human)', () => {
     expect(
-      scheduleApproval({ socialPost: [post('schedule', 'tomorrow-ish')] }, now)
+      scheduleApproval({ socialPost: [post('schedule', inAWeek)] })
     ).toEqual(expect.any(String));
   });
 
-  it('does not gate a future date', () => {
-    expect(
-      scheduleApproval({ socialPost: [post('schedule', at(6))] }, now)
-    ).toBeNull();
+  it('does not gate drafts', () => {
+    expect(scheduleApproval({ socialPost: [post('draft', inAWeek)] })).toBeNull();
   });
 
-  it('does not gate drafts, whatever the date', () => {
+  it('gates the whole call when any one item would be posted', () => {
     expect(
-      scheduleApproval({ socialPost: [post('draft', at(-60))] }, now)
-    ).toBeNull();
-  });
-
-  it('gates the whole call when any one item triggers', () => {
-    expect(
-      scheduleApproval(
-        {
-          socialPost: [
-            post('schedule', at(600)),
-            post('draft', at(0)),
-            post('now', at(0)),
-          ],
-        },
-        now
-      )
+      scheduleApproval({
+        socialPost: [post('draft', inAWeek), post('schedule', inAWeek)],
+      })
     ).toEqual(expect.any(String));
   });
 });

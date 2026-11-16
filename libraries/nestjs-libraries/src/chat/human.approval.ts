@@ -10,27 +10,18 @@ const DAY = 24 * 60 * 60;
 const approvedTtl = 7 * DAY;
 const claimTtl = 30 * DAY;
 
-// A post that goes out now, or within this long, needs a human
-const publishNowWindowMs = 5 * 60 * 1000;
-
-// Reason when any non-draft item publishes (or may publish) at once, null
-// otherwise. Shared by the MCP schedule tool and POST /public/v1/posts.
-export const publishNowReason = (
-  items: { type?: string; date?: string }[] | undefined,
-  now = Date.now()
+// Owner's rule: nothing is posted without a human. Any item that will go out,
+// now or at a scheduled time, needs approval; only drafts (which never
+// publish on their own) don't. Shared by the MCP schedule tool and the
+// public API post routes.
+export const publishReason = (
+  items: { type?: string }[] | undefined
 ): string | null => {
-  const publishesNow = (Array.isArray(items) ? items : []).some((p) => {
-    if (p?.type === 'draft') {
-      return false;
-    }
-    const time = Date.parse(p?.date as string);
-    return (
-      p?.type === 'now' ||
-      Number.isNaN(time) ||
-      time <= now + publishNowWindowMs
-    );
-  });
-  return publishesNow ? 'Publishing a post now (or within 5 minutes)' : null;
+  const list = Array.isArray(items) ? items : [];
+  // an empty or missing list can't be checked: fail closed
+  const publishes =
+    list.length === 0 || list.some((p) => p?.type !== 'draft');
+  return publishes ? 'Publishing or scheduling a post' : null;
 };
 
 export interface ApprovalConfig {

@@ -89,7 +89,10 @@ Rollback: remove the edge routes and unset `MCP_URL`. No app code, data or schem
 
 ## Owner decisions (2026-11-16)
 
-1. Delete and publish-now tools **stay**, and every MCP call to them goes through **DharaHIL** human approval and
+1. **Correction 2026-11-17 (owner):** nothing is posted and nothing is deleted without a human. Deleting, and
+   posting anything (now **or scheduled, at any date**), goes through DharaHIL; only drafts don't. The first version
+   gated only "publish-now" (within 5 minutes), which let an agent post anything by scheduling it 6 minutes ahead.
+   Original wording: delete and publish-now tools **stay**, and every MCP call to them goes through **DharaHIL** human approval and
    fails closed. This is the TaskPilot / ERPNext pattern. → Phase G.
 2. OAuth hardening: **do it properly, in this fork** (Postiz already has an authorization server that only needs
    fixing, so the fleet rule doesn't make us wait for Studio). → Phases H1 to H3.
@@ -108,7 +111,7 @@ There are no tests in the repo. `jest.config.ts` and `jest.preset.js` need `@nx/
   `jest.preset.js` if nothing else uses it.
 - Check: `pnpm test` runs one trivial spec and passes. This ships inside the Phase G PR.
 
-## Phase G: DharaHIL approval for delete and publish-now over MCP (revised after review)
+## Phase G: DharaHIL approval for deleting and posting over MCP (revised after review and the owner's correction)
 
 Facts the design rests on (verified):
 - The gateway reuses a request for the same `idempotency_key` **only while it is PENDING**
@@ -123,7 +126,7 @@ Facts the design rests on (verified):
 One generic wrapper enforces it, so the helper never names a tool.
 - `deletePostTool` (`tools/delete.post.tool.ts:45`) is always gated.
 - `schedulePostTool` (`tools/integration.schedule.post.ts:173`) is gated when **any** `socialPost` item has
-  `type == "now"`, or a date at or before now + 5 minutes. The whole call is gated, after validation (`:181-247`)
+  is not `draft` (now **or scheduled at any date**; superseded rule was "now or within 5 minutes"). The whole call is gated, after validation (`:181-247`)
   and before the `createPost` loop (`:249`).
 
 **Where it applies: fail closed.** Every `runWithContext` call in `start.mcp.ts` (`:396`, `:446`, `:486`, `:525`) sets
@@ -162,7 +165,7 @@ gated actions outright with "not available through the relay".
    - `EXECUTED`: "already done".
    - `REJECTED`, `AUTO_DENIED`, `EXPIRED`, `REVISE_REQUESTED`, `DENY` or any unknown status: delete the mapping and
      return `isError` with the reason. A later call starts a fresh request.
-   - Any `date` that doesn't parse counts as publish-now (gated).
+   - An empty or missing post list is gated (fail closed).
    - In-app chat check on dev: `copilot.controller.ts:85-113` sets a Mastra `requestContext`. Confirm that ALS
      `surface: 'app'` reaches the tools through CopilotRuntime. If it doesn't, in-app delete gets gated, which fails
      closed but must be fixed before release.
@@ -170,10 +173,10 @@ gated actions outright with "not available through the relay".
    on**; there is no off switch. With config missing, gated actions return `isError` "approval service not configured".
    Add the keys to `soul/stack.yml`, `.env.example` and the Portainer Env.
 
-**Not gated:** future scheduling, drafts, edits and reads. This is the owner's scope: delete and publish-now only.
+**Not gated:** drafts and reads. Everything that will be posted, and every delete, is gated (owner, 2026-11-17).
 
 **Rollout dependency:** the DharaHIL `postiz` app must exist before this deploys. Otherwise every MCP delete or
-publish-now is refused, which changes behaviour for the key-based agents that use them today.
+posting or scheduling is refused, which changes behaviour for the key-based agents that use them today.
 
 **Checks (jest):**
 - Key stability: canonical order gives the same key; different args or a different org give a different key.
@@ -181,7 +184,7 @@ publish-now is refused, which changes behaviour for the key-based agents that us
 - The claim, against a mocked ioredis that honours NX: a second execution is refused; `running` and `done` give
   different messages; a missing `REDIS_URL` (MockRedis) refuses.
 - Edited `approved_args` that fail validation, or that point at another org's integration, are refused.
-- The trigger: `now`, a past date and a date within 5 minutes are gated; a future date and drafts are not.
+- The trigger: `now`, `schedule` at any date, `update` and unknown types are gated; only all-draft calls pass.
 - Fail closed: no config gives an error, and an undefined surface is gated.
 - Dev-instance run-through: delete → waiting → approve → deleted → call again → "already done".
 
@@ -191,8 +194,9 @@ Gap: the org API key (and `pos_` tokens, `public.auth.middleware.ts:32-38`) also
 (`apps/backend/src/public-api/routes/v1/public.integrations.controller.ts`). Without a gate there, the MCP-only gate
 is bypassed by calling REST. The grihatek agents post through a Paperclip "postiz-api-key-shim" over this API.
 
-Gated routes (owner's scope: delete and publish-now):
-- `POST /public/v1/posts` (`:147`) when any post is `type: "now"`, or dated at or before now + 5 min, or has an
+Gated routes (owner's rule: nothing posted or deleted without a human):
+- `PUT /public/v1/posts/:id/status` to `schedule` (moves a draft into the posting queue).
+- `POST /public/v1/posts` (`:147`) unless it is a draft (superseded: only now / within 5 min / an
   unparseable date. The trigger rule is the one from Phase G, shared.
 - `DELETE /public/v1/posts/:id` (`:234`) and `DELETE /public/v1/posts/group/:group` (`:244`).
 
@@ -295,8 +299,8 @@ Flow:
 ## Owner-visible choices made in this revision
 
 - Static OAuth apps and HubSpot keep long-lived tokens. Only MCP clients get the 1 h / rotating model.
-- The gate has no off switch. If DharaHIL is missing or down, MCP delete and publish-now are refused.
-- "Publish now" includes a schedule dated within 5 minutes of now.
+- The gate has no off switch. If DharaHIL is missing or down, deleting and posting over MCP and the public API are refused.
+- Every non-draft post needs approval, whatever its date (owner, 2026-11-17).
 - Gated actions through a self-hosted relay are refused (the relay is not used here).
 
 ## Upstream

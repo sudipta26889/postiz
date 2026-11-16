@@ -8,7 +8,7 @@ import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 import { AllProvidersSettings } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/all.providers.settings';
 import { Integration } from '@prisma/client';
 import { checkAuth } from '@gitroom/nestjs-libraries/chat/auth.context';
-import { publishNowReason } from '@gitroom/nestjs-libraries/chat/human.approval';
+import { publishReason } from '@gitroom/nestjs-libraries/chat/human.approval';
 import {
   ValidUrlExtension,
   ValidUrlPath,
@@ -59,12 +59,11 @@ const toMedia = (
         thumbnailTimestamp: a.thumbnailTimestamp,
       };
 
-// Any one item that publishes now gates the whole call; drafts never do.
-// The rule is shared with POST /public/v1/posts (human.approval.ts).
-export const scheduleApproval = (
-  inputData: { socialPost?: { type?: string; date?: string }[] },
-  now = Date.now()
-): string | null => publishNowReason(inputData?.socialPost, now);
+// Any item that will be posted (now or scheduled) gates the whole call;
+// drafts never do. The rule is shared with the public API (human.approval.ts).
+export const scheduleApproval = (inputData: {
+  socialPost?: { type?: string }[];
+}): string | null => publishReason(inputData?.socialPost);
 
 @Injectable()
 export class IntegrationSchedulePostTool implements AgentToolInterface {
