@@ -704,10 +704,11 @@ export class PublicIntegrationsController {
     @Body() body: UpdatePostSettingsDto
   ) {
     Sentry.metrics.count('public_api-request', 1);
-    // a draft's settings are free; a scheduled post's change what goes out,
-    // so a human approves them (DharaHIL)
+    // only a scheduled (QUEUE) post's settings change what goes out, so only
+    // those ask a human (DharaHIL); drafts are free, and anything else is
+    // refused by the service at once instead of paging a person for nothing
     const snapshot = await this._postsService.approvalSnapshot(org.id, id);
-    if (snapshot.state === 'DRAFT') {
+    if (snapshot.state !== 'QUEUE') {
       return this._postsService.updatePostSettings(
         org.id,
         id,
