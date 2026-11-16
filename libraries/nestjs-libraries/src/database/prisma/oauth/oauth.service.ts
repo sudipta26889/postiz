@@ -1132,7 +1132,10 @@ export class OAuthService {
     return {
       access_token: refreshToken,
       token_type: 'bearer',
-      scope: this.grantedScope(app),
+      scope: this.grantedScope(
+        app,
+        'scope' in authorization ? authorization.scope : null
+      ),
       ...this.refreshFields(app, refreshToken),
     };
   }

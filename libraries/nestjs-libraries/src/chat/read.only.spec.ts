@@ -43,6 +43,24 @@ describe('read-only connections in MCP tools', () => {
     const write = guard(tool(false));
     await expect(as('mcp:read mcp:write', () => write.execute({}, {}))).resolves.toBe('ran');
     await expect(as(undefined, () => write.execute({}, {}))).resolves.toBe('ran');
-    await expect(write.execute({}, {})).resolves.toBe('ran');
   });
 });
+
+describe('read-only is checked before the approval gate', () => {
+  it('a gated write under mcp:read is refused without filing an approval', async () => {
+    const svc: any = new LoadToolsService({} as any);
+    const decide = jest.fn(async () => ({ status: 'pending' }));
+    svc.gate = (_p: any, t: any) => ({ ...t, execute: async (...a: any[]) => { await decide(); return t.execute(...a); } });
+    const wrapped = svc.readOnlyGuard(svc.gate({}, tool(false)));
+    await expect(as('mcp:read', () => wrapped.execute({}, {}))).rejects.toThrow(/read-only/);
+    expect(decide).not.toHaveBeenCalled();
+  });
+
+  it('fails closed with no request context unless it is the in-app chat', async () => {
+    const write = guard(tool(false));
+    await expect(write.execute({}, {})).rejects.toThrow(/could not be identified/);
+    const ui = { requestContext: { get: (k: string) => (k === 'ui' ? 'true' : undefined) } };
+    await expect(write.execute({}, ui)).resolves.toBe('ran');
+  });
+});
+

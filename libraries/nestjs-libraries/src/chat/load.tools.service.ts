@@ -42,7 +42,9 @@ export class LoadToolsService {
           .filter((p) => !p.available || p.available())
           .map(async (p) => ({
             name: p.name as string,
-            tool: this.gate(p, this.readOnlyGuard(await p.run())),
+            // read-only outside the approval gate: a read-only connection's
+            // write is refused before any approval is even asked for
+            tool: this.readOnlyGuard(this.gate(p, await p.run())),
           }))
       )
     ).reduce(
@@ -66,7 +68,15 @@ export class LoadToolsService {
     }
     const execute = tool.execute;
     tool.execute = async (inputData: any, context: any) => {
-      const scope = getContext()?.scope;
+      const ctx = getContext();
+      // fail closed: with no request context at all, only the in-app chat
+      // (its Mastra request context says ui = 'true') may change data
+      if (!ctx && context?.requestContext?.get?.('ui') !== 'true') {
+        throw new Error(
+          `${tool.id || 'This tool'} changes data and the caller could not be identified; refused.`
+        );
+      }
+      const scope = ctx?.scope;
       if (scope && !scope.split(' ').includes('mcp:write')) {
         throw new Error(
           `This connection is read-only (granted: ${scope}); ${tool.id || 'this tool'} changes data. Reconnect with write access to use it.`
