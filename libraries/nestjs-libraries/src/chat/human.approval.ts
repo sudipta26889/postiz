@@ -643,9 +643,14 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     // (design: approval-preview): never another caller's raw args, and never
     // args a person edited in DharaHIL (the draft is what they previewed)
     if (data.metadata?.staged === 'true') {
+      // what the person may edit: not the staging or its preview links
       const without = (a: any) => {
         const { staged: _s, ...rest } = a || {};
-        return canonicalJson(rest);
+        return canonicalJson(
+          Object.fromEntries(
+            Object.entries(rest).filter(([k]) => !/^preview_\d+$/.test(k))
+          )
+        );
       };
       const problem = !Array.isArray(filed?.staged)
         ? 'the drafts it was filed with could not be found, nothing was done'
@@ -799,6 +804,12 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     const linkFields = Object.fromEntries(
       links.map((l, i) => [`preview_${i + 1}`, l.url])
     );
+    // DharaHIL builds the card's field values from tool_args itself (it
+    // never trusts a client's redacted copy), so the links ride in the filed
+    // args; the approved run only reads `staged` and ignores them
+    if (links.length) {
+      filed = { ...filed, ...linkFields };
+    }
 
     const created = await call(cfg, 'POST', '/v1/requests', {
       tenant_id: cfg.tenantId,
