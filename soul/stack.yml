@@ -42,6 +42,9 @@ x-env: &env
   MASTODON_CLIENT_ID: ${MASTODON_CLIENT_ID:-}
   MASTODON_CLIENT_SECRET: ${MASTODON_CLIENT_SECRET:-}
   MASTODON_URL: ${MASTODON_URL:-}
+  # Public MCP base (no /api): the edge routes /mcp-oauth*, /mcp, /sse, /message and the
+  # OAuth discovery documents to the backend, so the UI shows URLs that connect
+  MCP_URL: ${MCP_URL:-https://postiz.sudiptadhara.in}
   NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-}
   NEXT_PUBLIC_DISCORD_SUPPORT: ${NEXT_PUBLIC_DISCORD_SUPPORT:-}
   NEXT_PUBLIC_POLOTNO: ${NEXT_PUBLIC_POLOTNO:-}
