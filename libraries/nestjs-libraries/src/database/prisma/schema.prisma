@@ -1725,6 +1725,9 @@ model OAuthAuthorization {
   codeChallenge       String?
   codeChallengeMethod String?
   redirectUri         String?
+  // what the person granted on the consent page: "mcp:read" for a read-only
+  // connection; NULL (every grant made before this) means read and write
+  scope               String?
   revokedAt           DateTime?
   createdAt           DateTime     @default(now())
   updatedAt           DateTime     @updatedAt

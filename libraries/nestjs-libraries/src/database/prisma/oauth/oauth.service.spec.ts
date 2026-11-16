@@ -100,7 +100,7 @@ describe('an OAuth token works only while its user is an active member', () => {
       findByAccessToken: jest.fn(async () => grant),
       isActiveMember,
     });
-    expect(await svc.getOrgByOAuthToken('pos_x')).toBe(grant);
+    expect(await svc.getOrgByOAuthToken('pos_x')).toMatchObject(grant);
     expect(isActiveMember).toHaveBeenCalledWith('u1', 'o1');
   });
 

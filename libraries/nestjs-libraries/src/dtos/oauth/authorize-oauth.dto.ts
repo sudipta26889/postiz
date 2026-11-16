@@ -61,6 +61,11 @@ export class ApproveOAuthDto {
   @IsIn(['approve', 'deny'])
   action: 'approve' | 'deny';
 
+  // "read": a read-only connection (mcp:read), chosen on the consent page
+  @IsOptional()
+  @IsIn(['read', 'write'])
+  access?: 'read' | 'write';
+
   @IsString()
   @IsOptional()
   redirect_uri?: string;

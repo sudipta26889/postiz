@@ -309,7 +309,8 @@ export class OAuthAuthorizedController {
         codeChallenge: body.code_challenge,
         codeChallengeMethod: body.code_challenge_method,
         redirectUri: body.redirect_uri,
-      })
+      }),
+      body.access === 'read'
     );
 
     const redirectUrl = new URL(redirectTarget);

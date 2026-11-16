@@ -86,6 +86,13 @@ export const startMcp = async (app: INestApplication) => {
   const loadToolsService = app.get(LoadToolsService, { strict: false });
   const mcpRelayService = app.get(McpRelayService, { strict: false });
 
+  // An OAuth connection's granted scope, for the read-only check in the tools
+  // (undefined for API keys: full access)
+  const resolveScope = async (token: string, resource?: string) =>
+    token.startsWith('pos_')
+      ? (await oauthService.getOrgByOAuthToken(token, resource))?.grantedScope
+      : undefined;
+
   // `resource`: the MCP path's canonical URL, so a token bound to another
   // resource (RFC 8707) is refused here; undefined for /mcp and the API
   const resolveAuth = async (token: string, resource?: string) => {
@@ -465,7 +472,8 @@ export const startMcp = async (app: INestApplication) => {
 
     endListenStream(req, res);
     fixAcceptHeader(req);
-    await runWithContext({ requestId: token!, auth, relay: relay || undefined, surface: 'mcp' }, async () => {
+    const scope = selfHosted ? undefined : await resolveScope(token!, url.toString());
+    await runWithContext({ requestId: token!, auth, relay: relay || undefined, surface: 'mcp', scope }, async () => {
       await (relay ? selfHostedServer! : mcpServer).startHTTP({
         url: url,
         httpPath: url.pathname,
@@ -515,7 +523,9 @@ export const startMcp = async (app: INestApplication) => {
     endListenStream(req, res);
     fixAcceptHeader(req);
     // @ts-ignore
-    await runWithContext({ requestId: token, auth: req.auth, surface: 'mcp' }, async () => {
+    const scope = await resolveScope(token);
+    // @ts-ignore
+    await runWithContext({ requestId: token, auth: req.auth, surface: 'mcp', scope }, async () => {
       await server.startHTTP({
         url,
         httpPath: url.pathname,

@@ -10,6 +10,9 @@ type Ctx = {
   // where the call came from: the approval gate (human.approval.ts) is skipped
   // only for 'app' (the in-app chat), so an entry point that forgets it is gated
   surface?: 'mcp' | 'app';
+  // an OAuth connection's granted scope ("mcp:read" = read-only); undefined
+  // for API keys and the in-app chat, which may do everything
+  scope?: string;
 };
 
 const als = new AsyncLocalStorage<Ctx>();

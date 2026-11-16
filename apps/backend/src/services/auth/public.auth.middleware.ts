@@ -43,6 +43,17 @@ export class PublicAuthMiddleware implements NestMiddleware {
           return;
         }
 
+        // a read-only connection (granted mcp:read only) may only read
+        if (
+          !authorization.grantedScope.split(' ').includes('mcp:write') &&
+          req.method !== 'GET'
+        ) {
+          res
+            .status(HttpStatus.FORBIDDEN)
+            .json({ msg: 'This connection is read-only' });
+          return;
+        }
+
         org = authorization.organization;
         // The user who approved the OAuth app, so /me can show who is connected
         // @ts-ignore
