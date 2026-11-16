@@ -16,5 +16,8 @@ export interface AgentToolInterface {
   approval?(args: any, orgId: string): string | null | Promise<string | null>;
   // checks for args a human edited before they run, a reason to refuse or null
   approvalValidate?(args: any, orgId: string): Promise<string | null>;
+  // what a gated call is about, however it is worded (see human.approval.ts
+  // DecideInput.target): stops duplicate approvals and double runs
+  approvalTarget?(args: any): string;
   run(): ToolReturn;
 }

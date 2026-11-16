@@ -242,6 +242,25 @@ Change:
 - The agent's message now says the action runs automatically once approved and must not be retried or changed.
   A repeat only reports status (`done` after the sweep ran it).
 
+## Phase G4: duplicates are approved and carried out once (2026-11-17)
+
+Problem: with G3, every approved request runs. A reworded retry by an agent is a separate request, so approving both
+would post twice.
+
+Change: every gated action declares a **target**, meaning what it is about regardless of wording:
+- posts (`postTarget`, shared by the MCP schedule tool and `POST /public/v1/posts`): each channel, the minute it goes
+  out (any date format), and the type;
+- deletes: `post:<id>`, `group:<group>`, `integration:<id>`;
+- settings: `post:<id>:settings:<canonical settings>`;
+- status: `post:<id>:status:<status>`.
+
+Rules, keyed by `org|action|target`:
+- While a request for a target is pending (`hil:target:pending:*`), a new call for the same target joins it. No
+  second request is filed.
+- Once a target was carried out (`hil:target:done:*`, 24 h), a new call answers "already done" without asking a
+  person. A separately filed request for the same target is refused before its claim.
+- A rejected or expired request releases its pending target.
+
 ## Phase H1: hardening with no schema change (revised)
 
 | Gap | Change |

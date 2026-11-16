@@ -45,7 +45,11 @@ import { GetNotificationsDto } from '@gitroom/nestjs-libraries/dtos/notification
 import * as Sentry from '@sentry/nestjs';
 import { publishReason } from '@gitroom/nestjs-libraries/chat/human.approval';
 import { publicApproval } from '@gitroom/nestjs-libraries/chat/public.approval';
-import { approvalGate } from '@gitroom/nestjs-libraries/chat/human.approval';
+import {
+  approvalGate,
+  canonicalJson,
+  postTarget,
+} from '@gitroom/nestjs-libraries/chat/human.approval';
 import {
   socialIntegrationList,
   IntegrationManager,
@@ -226,6 +230,13 @@ export class PublicIntegrationsController implements OnModuleInit {
       org: org.id,
       args: rawBody,
       reason,
+      target: postTarget(
+        (Array.isArray(rawBody?.posts) ? rawBody.posts : []).map((p: any) => ({
+          integrationId: p?.integration?.id,
+          date: rawBody?.date,
+          type: rawBody?.type,
+        }))
+      ),
       // an approved edit goes through every check below again
       execute: (args) => this.approvedActions['public.posts.create'](org, args),
     });
@@ -323,6 +334,7 @@ export class PublicIntegrationsController implements OnModuleInit {
       action: 'public.posts.delete',
       org: org.id,
       args: { id },
+      target: `post:${id}`,
       reason: 'Deleting a post cannot be undone',
       execute: (args) => this.approvedActions['public.posts.delete'](org, args),
     });
@@ -338,6 +350,7 @@ export class PublicIntegrationsController implements OnModuleInit {
       action: 'public.posts.deleteGroup',
       org: org.id,
       args: { group },
+      target: `group:${group}`,
       reason: 'Deleting a post group cannot be undone',
       execute: (args) =>
         this.approvedActions['public.posts.deleteGroup'](org, args),
@@ -685,6 +698,7 @@ export class PublicIntegrationsController implements OnModuleInit {
       action: 'public.integrations.delete',
       org: org.id,
       args: { id },
+      target: `integration:${id}`,
       reason: 'Deleting a channel and its posts cannot be undone',
       execute: (args) =>
         this.approvedActions['public.integrations.delete'](org, args),
@@ -769,6 +783,7 @@ export class PublicIntegrationsController implements OnModuleInit {
     return publicApproval.run({
       action: 'public.posts.settings',
       org: org.id,
+      target: `post:${id}:settings:${canonicalJson(body.settings ?? null)}`,
       args: { id, settings: body.settings, snapshot: snapshot.hash },
       reason: `Changing the settings of a scheduled post: "${snapshot.preview}"`,
       execute: (args) =>
@@ -806,6 +821,7 @@ export class PublicIntegrationsController implements OnModuleInit {
     return publicApproval.run({
       action: 'public.posts.status',
       org: org.id,
+      target: `post:${id}:status:${body?.status}`,
       args: { id, status: body?.status, snapshot: snapshot.hash },
       reason: `Scheduling a draft to be posted: "${snapshot.preview}"`,
       execute: (args) => this.approvedActions['public.posts.status'](org, args),

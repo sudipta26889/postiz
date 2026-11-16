@@ -8,7 +8,10 @@ import { makeId } from '@gitroom/nestjs-libraries/services/make.is';
 import { AllProvidersSettings } from '@gitroom/nestjs-libraries/dtos/posts/providers-settings/all.providers.settings';
 import { Integration } from '@prisma/client';
 import { checkAuth } from '@gitroom/nestjs-libraries/chat/auth.context';
-import { publishReason } from '@gitroom/nestjs-libraries/chat/human.approval';
+import {
+  postTarget,
+  publishReason,
+} from '@gitroom/nestjs-libraries/chat/human.approval';
 import {
   ValidUrlExtension,
   ValidUrlPath,
@@ -73,6 +76,9 @@ export class IntegrationSchedulePostTool implements AgentToolInterface {
   ) {}
   name = 'integrationSchedulePostTool';
   approval = scheduleApproval;
+  approvalTarget = (args: {
+    socialPost?: { integrationId?: string; date?: string; type?: string }[];
+  }) => postTarget(args?.socialPost || []);
 
   // A human may have edited the approved args: every channel must still be
   // one of this organization's (the rest of the checks run in execute)

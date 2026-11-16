@@ -1,6 +1,7 @@
 import {
   approvalKey,
   canonicalJson,
+  postTarget,
   createApprovalGate,
   publishReason,
 } from '@gitroom/nestjs-libraries/chat/human.approval';
@@ -15,8 +16,9 @@ const json = (body: any, status = 200) => ({
 const setup = (answers: any[], hasRedis = true) => {
   const data = new Map<string, string>();
   const queue = [...answers];
+  const fetch = jest.fn(async () => queue.shift() ?? json({}));
   const gate = createApprovalGate({
-    fetch: (async () => queue.shift() ?? json({})) as any,
+    fetch: fetch as any,
     redis: {
       get: async (k: string) => data.get(k) ?? null,
       set: async (k: string, v: string, ...o: any[]) => {
@@ -34,7 +36,7 @@ const setup = (answers: any[], hasRedis = true) => {
     hasRedis: () => hasRedis,
     config: () => ({ baseUrl: 'https://hil', tenantId: 't', appId: 'a', apiKey: 'k' }),
   });
-  return { gate, data };
+  return { gate, data, fetch };
 };
 
 const created = json({
@@ -263,5 +265,92 @@ describe('sweep robustness', () => {
     await gate.sweep();
     expect(run).toHaveBeenCalledTimes(1);
     expect(JSON.parse((globalThis as any).__sets['hil:pending'])).toEqual([]);
+  });
+});
+
+describe('duplicates: a target is approved and carried out once', () => {
+  beforeEach(() => {
+    (globalThis as any).__sets = {};
+  });
+
+  const withTarget = (args: any, execute = jest.fn()) => ({
+    ...input(execute),
+    args,
+    target: 'post:p1',
+  });
+  const posts = (fetch: jest.Mock) =>
+    fetch.mock.calls.filter(
+      ([url, init]: any) => init?.method === 'POST' && url.endsWith('/v1/requests')
+    ).length;
+
+  it('joins a reworded retry to the request already waiting, filing nothing new', async () => {
+    const { gate, fetch } = setup([created]);
+    const first = await gate.decide(withTarget({ id: 'p1' }));
+    const reworded = await gate.decide(withTarget({ id: 'p1', note: 'please' }));
+    expect(first).toMatchObject({ status: 'pending', requestId: 'req1' });
+    expect(reworded).toMatchObject({ status: 'pending', requestId: 'req1' });
+    expect((reworded as any).message).toMatch(/no duplicate was filed/);
+    expect(posts(fetch)).toBe(1);
+  });
+
+  it('does not ask again once the target was carried out', async () => {
+    const { gate, fetch } = setup([created, approved, json({})]);
+    const run = jest.fn(async () => 'ok');
+    gate.registerExecutor('public.posts.delete', { execute: run });
+    await gate.decide(withTarget({ id: 'p1' }));
+    await gate.sweep();
+    expect(run).toHaveBeenCalledTimes(1);
+
+    const later = await gate.decide(withTarget({ id: 'p1', note: 'again' }));
+    expect(later.status).toBe('done');
+    expect(posts(fetch)).toBe(1);
+  });
+
+  it('runs only one of two separately filed requests for the same target', async () => {
+    const created2 = json({
+      request_id: 'req2',
+      version: 1,
+      status: 'PENDING',
+      expires_at: expiresAt,
+    });
+    const approved2 = json({
+      status: 'APPROVED',
+      last_decision_by: { email: 'owner@example.test' },
+      version: 2,
+      metadata: { org: 'org1', tool: 'public.posts.delete' },
+      approved_args: { id: 'p1', note: 'x' },
+    });
+    const { gate, data } = setup([created, created2, approved, json({}), approved2]);
+    const run = jest.fn(async () => 'ok');
+    gate.registerExecutor('public.posts.delete', { execute: run });
+
+    await gate.decide(withTarget({ id: 'p1' }));
+    // the first request's target index expired: a second request gets filed
+    for (const k of [...data.keys()]) {
+      if (k.startsWith('hil:target:pending:')) data.delete(k);
+    }
+    expect((await gate.decide(withTarget({ id: 'p1', note: 'x' }))).requestId).toBe('req2');
+
+    await gate.sweep();
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('postTarget', () => {
+  it('ignores date format and item order, and keeps channel, minute and type', () => {
+    const a = postTarget([
+      { integrationId: 'i2', date: '2026-12-01T10:00:00Z', type: 'schedule' },
+      { integrationId: 'i1', date: '2026-12-01T10:00:30.000Z', type: 'schedule' },
+    ]);
+    const b = postTarget([
+      { integrationId: 'i1', date: '2026-12-01T15:30:00+05:30', type: 'schedule' },
+      { integrationId: 'i2', date: 'Tue, 01 Dec 2026 10:00:00 GMT', type: 'schedule' },
+    ]);
+    expect(b).toBe(a);
+    expect(
+      postTarget([{ integrationId: 'i1', date: '2026-12-01T10:01:00Z', type: 'schedule' }])
+    ).not.toBe(
+      postTarget([{ integrationId: 'i1', date: '2026-12-01T10:00:00Z', type: 'schedule' }])
+    );
   });
 });

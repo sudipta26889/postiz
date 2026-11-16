@@ -13,6 +13,8 @@ export interface WithApprovalOptions {
   approval: (args: any, orgId: string) => string | null | Promise<string | null>;
   // extra checks on args a human edited, a reason to refuse or null
   validate?: (args: any, orgId: string) => Promise<string | null> | string | null;
+  // what the call is about, however it is worded (human.approval.ts)
+  target?: (args: any) => string;
   execute: (inputData: any, context: any) => Promise<any>;
 }
 
@@ -54,6 +56,7 @@ export const createMcpApproval = (gate = approvalGate) => ({
         org,
         args: inputData,
         reason,
+        target: opts.target?.(inputData),
         validate: opts.validate,
         execute: (args) => opts.execute(args, context),
         // a tool answering with errors did nothing: the claim is released

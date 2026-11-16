@@ -78,6 +78,7 @@ export class LoadToolsService {
       toolName: p.name,
       approval: (args, orgId) => p.approval!(args, orgId),
       validate,
+      target: p.approvalTarget ? (args) => p.approvalTarget!(args) : undefined,
       execute,
     });
 

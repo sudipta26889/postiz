@@ -68,6 +68,11 @@ export interface DecideInput<T> {
   isNoop?: (result: T) => boolean;
   // same, for an error thrown before any side effect
   releaseOnError?: (err: unknown) => boolean;
+  // what the action is about, independent of how it is worded (a post id,
+  // the channels and minute a post goes out): a reworded retry joins the
+  // pending request instead of filing another, and an action already carried
+  // out is not done again for a day
+  target?: string;
 }
 
 // How Postiz carries out an approved action on its own (no agent retry):
@@ -77,6 +82,26 @@ export interface ApprovalExecutor {
   validate?: (args: any, orgId: string) => Promise<string | null> | string | null;
   isNoop?: (result: any) => boolean;
 }
+
+// The minute a post goes out, whatever format the date came in
+const minuteOf = (date: unknown) => {
+  const time = Date.parse(date as string);
+  return Number.isNaN(time)
+    ? String(date ?? '')
+    : new Date(time).toISOString().slice(0, 16);
+};
+
+// What a post request is about, however it is worded: each channel, the
+// minute it goes out and how (now / schedule). Shared by the MCP schedule
+// tool and POST /public/v1/posts
+export const postTarget = (
+  items: { integrationId?: string; date?: unknown; type?: string }[]
+) =>
+  'posts:' +
+  items
+    .map((p) => `${p.integrationId ?? '?'}@${minuteOf(p.date)}:${p.type ?? '?'}`)
+    .sort()
+    .join(',');
 
 // Canonical JSON: sorted keys, like the DharaHIL SDK
 export const canonicalJson = (value: any): string => {
@@ -165,6 +190,17 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
   const pendingKey = (requestId: string) => `hil:pending:${requestId}`;
   const pendingSet = 'hil:pending';
   const executors = new Map<string, ApprovalExecutor>();
+  const doneTargetTtl = DAY;
+  const targetId = (input: { org: string; action: string; target?: string }) =>
+    input.target
+      ? crypto
+          .createHash('sha256')
+          .update(`${input.org}|${input.action}|${input.target}`)
+          .digest('hex')
+          .slice(0, 24)
+      : null;
+  const pendingTargetKey = (t: string) => `hil:target:pending:${t}`;
+  const doneTargetKey = (t: string) => `hil:target:done:${t}`;
   const execKey = (requestId: string) => `hil:exec:${requestId}`;
 
   const ttlUntil = (expiresAt: string) =>
@@ -189,6 +225,18 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     args: any,
     input: DecideInput<T>
   ): Promise<ApprovalDecision<T>> => {
+    // a different request for the same target already ran: a duplicate
+    const target = targetId(input);
+    if (target) {
+      const doneBy = await deps.redis.get(doneTargetKey(target));
+      if (doneBy && doneBy !== requestId) {
+        return {
+          status: 'refused',
+          message: `Not carried out: this duplicates request ${doneBy}, which was already done.`,
+        };
+      }
+    }
+
     const claimed = await deps.redis.set(
       execKey(requestId),
       'running',
@@ -229,6 +277,10 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     }
 
     await deps.redis.set(execKey(requestId), 'done', 'EX', claimTtl);
+    if (target) {
+      await deps.redis.set(doneTargetKey(target), requestId, 'EX', doneTargetTtl);
+      await deps.redis.del(pendingTargetKey(target));
+    }
     try {
       await call(cfg, 'POST', `/v1/requests/${requestId}/executed`, {
         version,
@@ -273,6 +325,13 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
 
     if (data.status !== 'APPROVED') {
       await deps.redis.del(reqKey(key));
+      const target = targetId(input);
+      if (
+        target &&
+        (await deps.redis.get(pendingTargetKey(target))) === requestId
+      ) {
+        await deps.redis.del(pendingTargetKey(target));
+      }
       return {
         status: 'refused',
         message: `Not approved (${data.status}${
@@ -321,6 +380,28 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     const mapped = await deps.redis.get(reqKey(key));
     if (mapped) {
       return read(cfg, key, mapped, input);
+    }
+
+    const target = targetId(input);
+    if (target) {
+      // already carried out: don't ask a person again
+      const doneBy = await deps.redis.get(doneTargetKey(target));
+      if (doneBy) {
+        return {
+          status: 'done',
+          requestId: doneBy,
+          message: `This was already done (request ${doneBy}); not asking again.`,
+        };
+      }
+      // a reworded retry of a request still waiting: join it, file nothing
+      const pendingBy = await deps.redis.get(pendingTargetKey(target));
+      if (pendingBy && (await deps.redis.get(pendingKey(pendingBy)))) {
+        await deps.redis.set(reqKey(key), pendingBy, 'EX', approvedTtl);
+        return pending(
+          pendingBy,
+          `A request for this is already waiting in DharaHIL (request ${pendingBy}); no duplicate was filed. Postiz carries it out automatically once approved: do not retry.`
+        );
+      }
     }
 
     const created = await call(cfg, 'POST', '/v1/requests', {
@@ -372,11 +453,20 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
           org: input.org,
           args: input.args,
           key,
+          target: input.target,
         }),
         'EX',
         ttlUntil(created.expires_at) + approvedTtl
       );
       await deps.redis.sadd(pendingSet, created.request_id);
+      if (target) {
+        await deps.redis.set(
+          pendingTargetKey(target),
+          created.request_id,
+          'EX',
+          ttlUntil(created.expires_at) + approvedTtl
+        );
+      }
       return pending(
         created.request_id,
         `Approval requested in DharaHIL (request ${created.request_id}, expires ${created.expires_at}). Once a person approves, Postiz carries it out automatically: do not retry or change the request. Calling again with the same arguments only reports its status.`,
@@ -453,7 +543,13 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
         continue;
       }
       // one unreadable entry must not stop every other approval
-      let item: { action: string; org: string; args: any; key: string };
+      let item: {
+        action: string;
+        org: string;
+        args: any;
+        key: string;
+        target?: string;
+      };
       try {
         item = JSON.parse(raw);
       } catch {
@@ -472,6 +568,7 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
           org: item.org,
           args: item.args,
           reason: '',
+          target: item.target,
           validate: executor.validate,
           isNoop: executor.isNoop,
           execute: (args) => executor.execute(item.org, args),
