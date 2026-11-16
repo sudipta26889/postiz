@@ -45,6 +45,7 @@ const created = json({
 const approved = (action: string, args: any) =>
   json({
     status: 'APPROVED',
+    last_decision_by: { email: 'owner@example.test' },
     version: 1,
     metadata: { org: 'org1', tool: action },
     approved_args: args,

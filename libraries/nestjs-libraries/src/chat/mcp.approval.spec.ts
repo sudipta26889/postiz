@@ -83,15 +83,24 @@ const created = (status = 'PENDING', extra: any = {}) =>
   });
 
 describe('approval decision mapping', () => {
-  it('runs at once when the policy allows', async () => {
+  it('refuses when the policy allows without a human (owner: a human decides every one)', async () => {
     for (const action of ['ALLOW', 'AUTO_ALLOWED']) {
       const { gate } = setup([json({ action, request_id: null })]);
-      const execute = jest.fn(async () => ({ output: { postId: 'p' } }));
-      await expect(run(gate, execute)).resolves.toEqual({
-        output: { postId: 'p' },
-      });
-      expect(execute).toHaveBeenCalledWith(args, expect.anything());
+      const execute = jest.fn();
+      await expect(run(gate, execute)).rejects.toThrow(/needs a human decision/);
+      expect(execute).not.toHaveBeenCalled();
     }
+  });
+
+  it('refuses an APPROVED request with no named human decider', async () => {
+    const { gate } = setup([
+      created(),
+      json({ status: 'APPROVED', version: 1, metadata: { org: 'org1', tool: 'deletePostTool' }, approved_args: args }),
+    ]);
+    const execute = jest.fn();
+    await run(gate, execute);
+    await expect(run(gate, execute)).rejects.toThrow(/named person/);
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it('refuses when the policy denies, or on any error', async () => {
@@ -163,7 +172,7 @@ describe('approval decision mapping', () => {
   it('refuses an APPROVED request that belongs to another org or tool', async () => {
     const { gate } = setup([
       created(),
-      json({ status: 'APPROVED', version: 1, metadata: { org: 'org2', tool: 'deletePostTool' } }),
+      json({ status: 'APPROVED', last_decision_by: { email: 'owner@example.test' }, version: 1, metadata: { org: 'org2', tool: 'deletePostTool' } }),
     ]);
     const execute = jest.fn();
     await run(gate, execute);
@@ -176,6 +185,7 @@ describe('claim: at most once', () => {
   const approved = (extra: any = {}) =>
     json({
       status: 'APPROVED',
+      last_decision_by: { email: 'owner@example.test' },
       version: 3,
       metadata: { org: 'org1', tool: 'deletePostTool' },
       approved_args: args,

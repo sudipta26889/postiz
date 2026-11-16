@@ -106,8 +106,6 @@ const redact = (value: any): any => {
   return value;
 };
 
-const PROCEED = ['ALLOW', 'AUTO_ALLOWED'];
-
 // A refusal that came from us, not from the action
 class ApprovalError extends Error {}
 
@@ -269,6 +267,14 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       };
     }
 
+    // a human must have made the decision (not a rule or a standing grant)
+    if (!data.last_decision_by?.email) {
+      return {
+        status: 'refused',
+        message: `Approval request ${requestId} was not approved by a named person`,
+      };
+    }
+
     // the GET has no tool_name: the metadata we set ties it to this call
     if (data.metadata?.org !== input.org || data.metadata?.tool !== input.action) {
       return {
@@ -325,13 +331,15 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       webhook: { url: '', headers: {}, decision_url: `${cfg.baseUrl}/v1/requests` },
     });
 
+    // No request means the policy decided on its own (ALLOW, AUTO_ALLOWED, a
+    // standing grant, DENY). Owner's rule: a human decides every one, so a
+    // policy that allows without a human is a misconfiguration: refuse.
     if (!created.request_id) {
-      if (PROCEED.includes(created.action)) {
-        return { status: 'executed', result: await input.execute(input.args) };
-      }
       return {
         status: 'refused',
-        message: `Approval refused (${created.action || 'unknown'})`,
+        message: `Approval refused (${
+          created.action || 'unknown'
+        }): this action needs a human decision in DharaHIL, and the policy answered without one`,
       };
     }
 

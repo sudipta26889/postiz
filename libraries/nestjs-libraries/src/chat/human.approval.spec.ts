@@ -41,6 +41,7 @@ const created = json({
 });
 const approved = json({
   status: 'APPROVED',
+  last_decision_by: { email: 'owner@example.test' },
   version: 2,
   metadata: { org: 'org1', tool: 'public.posts.delete' },
   approved_args: { id: 'p1' },
