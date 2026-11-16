@@ -131,6 +131,56 @@ export class OAuthRepository {
     });
   }
 
+  // The one extra pair a client may get when it sent the same refresh
+  // twice at once: only while the old token is unrevoked and was used within
+  // the grace window, and it is then spent for good (revokedAt), in the same
+  // transaction as the new pair. A revoke or re-consent in between wins
+  async graceReissue(
+    oldId: string,
+    usedSince: Date,
+    next: Parameters<OAuthRepository['issueTokens']>[0]
+  ) {
+    return this._transaction.model.$transaction(async (tx) => {
+      const { count } = await tx.oAuthToken.updateMany({
+        where: { id: oldId, revokedAt: null, usedAt: { gte: usedSince } },
+        data: { revokedAt: new Date() },
+      });
+      if (count !== 1) {
+        return false;
+      }
+      await tx.oAuthToken.createMany({
+        data: [
+          {
+            authorizationId: next.authorizationId,
+            kind: 'access',
+            tokenHash: next.access.hash,
+            familyId: next.familyId,
+            scope: next.scope,
+            resource: next.resource,
+            expiresAt: next.access.expiresAt,
+          },
+          {
+            authorizationId: next.authorizationId,
+            kind: 'refresh',
+            tokenHash: next.refresh.hash,
+            familyId: next.familyId,
+            scope: next.scope,
+            resource: next.resource,
+            expiresAt: next.refresh.expiresAt,
+          },
+        ],
+      });
+      return true;
+    });
+  }
+
+  // Tokens long expired are of no use to anyone: kept 30 days for audit
+  pruneExpiredTokens(olderThan: Date) {
+    return this._oauthToken.model.oAuthToken.deleteMany({
+      where: { expiresAt: { lt: olderThan } },
+    });
+  }
+
   // A replayed refresh token: every token of its family and the grant end
   async revokeFamilyAndGrant(familyId: string, authorizationId: string) {
     await this._transaction.model.$transaction([

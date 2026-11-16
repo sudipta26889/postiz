@@ -243,7 +243,8 @@ export const startMcp = async (app: INestApplication) => {
     '/mcp-oauth-chatgpt': {
       issuer: new URL('/mcp-oauth-chatgpt', process.env.NEXT_PUBLIC_BACKEND_URL!).toString(),
       registration: false,
-      refresh: false,
+      // a dynamic client here gets 1 h tokens (H2): it must see refresh
+      refresh: true,
     },
     '/mcp-oauth-dynamic': {
       issuer: new URL('/mcp-oauth-dynamic', process.env.NEXT_PUBLIC_BACKEND_URL!).toString(),

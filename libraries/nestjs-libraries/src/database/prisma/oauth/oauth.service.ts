@@ -574,6 +574,10 @@ export class OAuthService {
         boundTo
       );
       await this._oauthRepository.issueTokens(tokens);
+      // long-expired tokens go, opportunistically (like stale apps)
+      this._oauthRepository
+        .pruneExpiredTokens(new Date(Date.now() - refreshTokenTtlMs))
+        .catch(() => {});
       return {
         id: auth.organizationId,
         cus: auth.organization?.paymentId,
@@ -747,17 +751,20 @@ export class OAuthService {
         old.resource,
         old.familyId
       );
-      const withinGrace =
-        !!old.usedAt && Date.now() - old.usedAt.getTime() <= refreshGraceMs;
-      if (old.usedAt && !withinGrace) {
+      const graceSince = new Date(Date.now() - refreshGraceMs);
+      if (old.usedAt && old.usedAt < graceSince) {
         await this._oauthRepository.revokeFamilyAndGrant(old.familyId, grant.id);
         this.invalidGrant();
       }
-      if (withinGrace || !(await this._oauthRepository.rotateRefresh(old.id, tokens))) {
-        // the same client refreshing twice at once: both get a pair
-        await this._oauthRepository.issueTokens(tokens);
+      if (await this._oauthRepository.rotateRefresh(old.id, tokens)) {
+        return response;
       }
-      return response;
+      // used a moment ago (the same client refreshing twice at once): one
+      // extra pair, atomically, and only if nothing revoked it meanwhile
+      if (await this._oauthRepository.graceReissue(old.id, graceSince, tokens)) {
+        return response;
+      }
+      this.invalidGrant();
     }
 
     // a long-lived token from before rotation: moved once onto a family,

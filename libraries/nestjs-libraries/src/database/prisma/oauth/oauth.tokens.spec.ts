@@ -48,6 +48,8 @@ const repoWith = (over: any = {}) => ({
   issueTokens: jest.fn(async () => ({ count: 2 })),
   findTokenByHash: jest.fn(async () => null),
   rotateRefresh: jest.fn(async () => true),
+  graceReissue: jest.fn(async () => true),
+  pruneExpiredTokens: jest.fn(async () => ({ count: 0 })),
   revokeFamilyAndGrant: jest.fn(async () => undefined),
   isActiveMember: jest.fn(async () => true),
   findByAccessToken: jest.fn(async () => null),
@@ -131,13 +133,29 @@ describe('refresh rotation for MCP clients', () => {
     expect(res.scope).toBe('mcp:read mcp:write');
   });
 
-  it('a second refresh within the grace window gets a pair too (one client double-sending)', async () => {
+  it('a second refresh within the grace window gets one pair, atomically (one client double-sending)', async () => {
     const repo = repoWith({
       findTokenByHash: jest.fn(async () => refreshRow({ usedAt: new Date(Date.now() - 5_000) })),
+      // already used, so the normal rotation can't take it
+      rotateRefresh: jest.fn(async () => false),
     });
     const res: any = await service(repo).refreshAccessToken('pca_dyn', 'posr_old');
     expect(res.access_token).toMatch(/^pos_/);
+    expect(repo.graceReissue).toHaveBeenCalledWith('tok-r', expect.any(Date), expect.objectContaining({ familyId: 'fam1' }));
+    expect(repo.issueTokens).not.toHaveBeenCalled();
     expect(repo.revokeFamilyAndGrant).not.toHaveBeenCalled();
+  });
+
+  it('no late pair when a revoke or re-consent landed meanwhile, or the grace pair was already taken', async () => {
+    const repo = repoWith({
+      findTokenByHash: jest.fn(async () => refreshRow({ usedAt: new Date(Date.now() - 5_000) })),
+      rotateRefresh: jest.fn(async () => false),
+      graceReissue: jest.fn(async () => false),
+    });
+    expect(await errorOf(service(repo).refreshAccessToken('pca_dyn', 'posr_old'))).toMatchObject({
+      body: { error: 'invalid_grant' },
+    });
+    expect(repo.issueTokens).not.toHaveBeenCalled();
   });
 
   it('a replay after the grace window revokes the family and the grant', async () => {
