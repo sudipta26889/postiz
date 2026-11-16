@@ -288,6 +288,8 @@ export const startMcp = async (app: INestApplication) => {
       : ['authorization_code'],
     token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
     code_challenge_methods_supported: ['S256'],
+    // a client_id may be the https URL of the client's own metadata (CIMD)
+    client_id_metadata_document_supported: true,
     scopes_supported: oauthScopes,
   });
 
