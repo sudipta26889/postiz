@@ -147,6 +147,10 @@ export class OAuthController {
   }
 
   @Post('/token')
+  // stops guessing a client secret; generous enough for clients refreshing
+  // from shared servers (claude.ai, ChatGPT)
+  @UseGuards(ThrottlerRealIpGuard)
+  @Throttle({ default: { limit: 120, ttl: 60000 } })
   // RFC 6749 §5.1: successful token responses are 200; strict clients (Canva) reject Nest's default 201
   @HttpCode(200)
   async token(
@@ -195,6 +199,10 @@ export class OAuthController {
 
   // RFC 7009: always 200 for an authenticated client, whatever the token
   @Post('/revoke')
+  // stops guessing a client secret; generous enough for clients refreshing
+  // from shared servers (claude.ai, ChatGPT)
+  @UseGuards(ThrottlerRealIpGuard)
+  @Throttle({ default: { limit: 120, ttl: 60000 } })
   @HttpCode(200)
   async revoke(
     @Body() body: RevokeTokenDto,
