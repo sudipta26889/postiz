@@ -642,7 +642,7 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     // a request filed with staged drafts only ever schedules those drafts
     // (design: approval-preview): never another caller's raw args, and never
     // args a person edited in DharaHIL (the draft is what they previewed)
-    if (data.metadata?.staged) {
+    if (data.metadata?.staged === 'true') {
       const without = (a: any) => {
         const { staged: _s, ...rest } = a || {};
         return canonicalJson(rest);
@@ -835,7 +835,8 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
         tool: input.action,
         ...(typeof input.args?.id === 'string' ? { post_id: input.args.id } : {}),
         // its approval may only ever schedule these drafts (see read())
-        ...(Array.isArray(filed?.staged) ? { staged: true } : {}),
+        // DharaHIL accepts only string metadata values (else 422)
+        ...(Array.isArray(filed?.staged) ? { staged: 'true' } : {}),
       },
       webhook: { url: '', headers: {}, decision_url: `${cfg.baseUrl}/v1/requests` },
     });

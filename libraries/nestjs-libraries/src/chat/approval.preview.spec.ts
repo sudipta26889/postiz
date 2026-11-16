@@ -74,6 +74,11 @@ describe('approval preview: the approver opens the real post', () => {
       { key: 'preview_1', label: 'ProDevs (x), planned 2027-06-01 10:00 UTC', type: 'url' },
     ]);
     expect(filed.context_summary).toContain('https://postiz.test/p/d1?share=true');
+    // DharaHIL refuses (422) any metadata value that is not a string
+    expect(filed.metadata.staged).toBe('true');
+    for (const value of Object.values(filed.metadata)) {
+      expect(typeof value).toBe('string');
+    }
   });
 
   it('an identical call stages nothing again, and the approved run gets the staged args', async () => {
@@ -127,7 +132,7 @@ describe('approval preview: the approver opens the real post', () => {
       status: 'APPROVED',
       last_decision_by: { email: 'owner@example.test' },
       version: 2,
-      metadata: { org: 'org1', tool: 'public.posts.create', staged: true },
+      metadata: { org: 'org1', tool: 'public.posts.create', staged: 'true' },
     });
     // a differently worded caller mapped to the request; its pending entry
     // and the staging are gone (another key, or expired)
@@ -147,7 +152,7 @@ describe('approval preview: the approver opens the real post', () => {
       status: 'APPROVED',
       last_decision_by: { email: 'owner@example.test' },
       version: 2,
-      metadata: { org: 'org1', tool: 'public.posts.create', staged: true },
+      metadata: { org: 'org1', tool: 'public.posts.create', staged: 'true' },
       approved_args: { type: 'schedule', posts: [{ text: 'edited by the approver' }], staged },
     });
     const { gate } = setup([created, edited]);
