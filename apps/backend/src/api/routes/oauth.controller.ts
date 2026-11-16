@@ -157,12 +157,14 @@ export class OAuthController {
     const basic = extractBasicCredentials(authorization);
     const clientId = basic?.clientId || body.client_id;
 
-    // Only HubSpot gets refresh tokens, the service answers every other
-    // client with unsupported_grant_type, as before
+    // MCP (dynamic) clients rotate refresh tokens, HubSpot keeps its static
+    // refresh; every other client gets unsupported_grant_type, as before
     if (body.grant_type === 'refresh_token') {
       return this._oauthService.refreshAccessToken(
         clientId,
-        body.refresh_token
+        body.refresh_token,
+        basic?.clientSecret || body.client_secret,
+        body.resource
       );
     }
 
@@ -185,7 +187,8 @@ export class OAuthController {
       clientId,
       basic?.clientSecret || body.client_secret,
       body.code_verifier,
-      body.redirect_uri
+      body.redirect_uri,
+      body.resource
     );
   }
 

@@ -25,6 +25,25 @@ const hubspotOAuthClientId = () =>
 // years (a hundred would not fit in a 32-bit integer)
 const hubspotTokenExpiresIn = 10 * 365 * 24 * 60 * 60;
 
+// MCP (dynamically registered) clients: short-lived access tokens and
+// rotating refresh tokens, stored only as sha256 (design: mcp-oauth.md, H2)
+const accessTokenTtlMs = 60 * 60 * 1000;
+const refreshTokenTtlMs = 30 * 24 * 60 * 60 * 1000;
+// two refreshes sent together by one client: the second one within this
+// window gets a new pair instead of being treated as a stolen-token replay
+const refreshGraceMs = 30 * 1000;
+const hashToken = (token: string) =>
+  createHash('sha256').update(token).digest('hex');
+
+// The MCP resources a token may be bound to (RFC 8707), exactly as the
+// protected-resource metadata advertises them (start.mcp.ts)
+const canonicalMcpResources = () =>
+  ['/mcp-oauth-dynamic', '/mcp-oauth-claude', '/mcp-oauth-chatgpt', '/mcp-oauth'].map(
+    (path) => new URL(path, process.env.NEXT_PUBLIC_BACKEND_URL).toString()
+  );
+const sameResource = (a: string, b: string) =>
+  a.replace(/\/+$/, '') === b.replace(/\/+$/, '');
+
 // The HubSpot app itself (HubSpot project > app > Auth tab), not the Postiz
 // app above: its redirect URL finishes the install, see completeHubspotInstall
 const hubspotAppClientId = () => process.env.HUBSPOT_APP_CLIENT_ID?.trim();
@@ -244,7 +263,7 @@ export class OAuthService {
       client_name: app.name,
       redirect_uris: redirectUris,
       token_endpoint_auth_method: tokenEndpointAuthMethod,
-      grant_types: ['authorization_code'],
+      grant_types: ['authorization_code', 'refresh_token'],
       response_types: ['code'],
       scope: 'mcp:read mcp:write',
     };
@@ -440,7 +459,7 @@ export class OAuthService {
     const encryptedCode = AuthService.fixedEncryption(code);
     const codeExpiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
-    await this._oauthRepository.createAuthorization({
+    const authorization = await this._oauthRepository.createAuthorization({
       oauthAppId,
       userId,
       organizationId,
@@ -450,6 +469,8 @@ export class OAuthService {
       codeChallengeMethod: pkce?.codeChallengeMethod,
       redirectUri: pkce?.redirectUri,
     });
+    // re-consent re-opens the grant: every token issued before it ends
+    await this._oauthRepository.revokeTokensOfAuthorization(authorization.id);
 
     return code;
   }
@@ -493,7 +514,8 @@ export class OAuthService {
     clientId: string,
     clientSecret?: string,
     codeVerifier?: string,
-    redirectUri?: string
+    redirectUri?: string,
+    resource?: string
   ) {
     const app = await this._oauthRepository.getAppByClientId(clientId);
     if (!app) {
@@ -535,6 +557,29 @@ export class OAuthService {
     }
 
     this.verifyCodeGrant(auth, codeVerifier, redirectUri);
+
+    // MCP clients get short-lived, hashed, rotating tokens; the code can be
+    // exchanged exactly once (a conditional update, safe under races)
+    if (app.dynamic) {
+      const boundTo = this.checkResource(resource);
+      if (!(await this._oauthRepository.consumeCode(auth.id, encryptedCode))) {
+        throw new HttpException(
+          { error: 'invalid_grant' },
+          HttpStatus.BAD_REQUEST
+        );
+      }
+      const { tokens, response } = this.issueTokenFamily(
+        auth.id,
+        this.grantedScope(app),
+        boundTo
+      );
+      await this._oauthRepository.issueTokens(tokens);
+      return {
+        id: auth.organizationId,
+        cus: auth.organization?.paymentId,
+        ...response,
+      };
+    }
 
     const token = 'pos_' + makeSecureId(40);
     const encryptedToken = AuthService.fixedEncryption(token);
@@ -636,6 +681,165 @@ export class OAuthService {
   // tokens never expire, so the refresh token is the access token itself:
   // refreshing hands it back unchanged, and it stops working exactly when the
   // access token does. No other client gets these fields
+  private invalidGrant(): never {
+    throw new HttpException({ error: 'invalid_grant' }, HttpStatus.BAD_REQUEST);
+  }
+
+  // Rotation for MCP clients (design H2): every refresh gives a new pair in
+  // the same family; a refresh token used again after the grace window means
+  // it leaked, so the family and the grant end
+  private async refreshDynamic(
+    app: OAuthApp,
+    refreshToken?: string,
+    clientSecret?: string,
+    resource?: string
+  ) {
+    if (
+      !this.isPublicClient(app) &&
+      (!clientSecret ||
+        !app.clientSecret ||
+        app.clientSecret !== AuthService.fixedEncryption(clientSecret))
+    ) {
+      throw new HttpException(
+        { error: 'invalid_client' },
+        HttpStatus.UNAUTHORIZED
+      );
+    }
+    if (!refreshToken) {
+      throw new HttpException(
+        { error: 'invalid_request', error_description: 'refresh_token is required' },
+        HttpStatus.BAD_REQUEST
+      );
+    }
+
+    const old = await this._oauthRepository.findTokenByHash(
+      hashToken(refreshToken)
+    );
+    if (old) {
+      const grant = old.authorization;
+      if (
+        old.kind !== 'refresh' ||
+        grant.oauthAppId !== app.id ||
+        old.revokedAt ||
+        grant.revokedAt ||
+        old.expiresAt.getTime() <= Date.now() ||
+        !(await this._oauthRepository.isActiveMember(
+          grant.userId,
+          grant.organizationId
+        ))
+      ) {
+        this.invalidGrant();
+      }
+      // the audience can't be switched on refresh
+      if (resource) {
+        const asked = this.checkResource(resource);
+        if (old.resource && !sameResource(old.resource, asked!)) {
+          throw new HttpException(
+            { error: 'invalid_target' },
+            HttpStatus.BAD_REQUEST
+          );
+        }
+      }
+      // scopes are the token's own, minted from the grant (never widened)
+      const { tokens, response } = this.issueTokenFamily(
+        grant.id,
+        old.scope,
+        old.resource,
+        old.familyId
+      );
+      const withinGrace =
+        !!old.usedAt && Date.now() - old.usedAt.getTime() <= refreshGraceMs;
+      if (old.usedAt && !withinGrace) {
+        await this._oauthRepository.revokeFamilyAndGrant(old.familyId, grant.id);
+        this.invalidGrant();
+      }
+      if (withinGrace || !(await this._oauthRepository.rotateRefresh(old.id, tokens))) {
+        // the same client refreshing twice at once: both get a pair
+        await this._oauthRepository.issueTokens(tokens);
+      }
+      return response;
+    }
+
+    // a long-lived token from before rotation: moved once onto a family,
+    // then it stops working
+    const legacy = await this._oauthRepository.findByAccessToken(
+      AuthService.fixedEncryption(refreshToken)
+    );
+    if (
+      !legacy ||
+      legacy.oauthAppId !== app.id ||
+      !(await this._oauthRepository.isActiveMember(
+        legacy.userId,
+        legacy.organizationId
+      ))
+    ) {
+      this.invalidGrant();
+    }
+    const { tokens, response } = this.issueTokenFamily(
+      legacy.id,
+      this.grantedScope(app),
+      resource ? this.checkResource(resource) : null
+    );
+    await this._oauthRepository.issueTokens(tokens);
+    await this._oauthRepository.clearLegacyAccessToken(legacy.id);
+    return response;
+  }
+
+  // RFC 8707: a token is bound to the MCP resource it was asked for; any
+  // other resource is invalid_target
+  private checkResource(resource?: string) {
+    if (!resource) {
+      return null;
+    }
+    const match = canonicalMcpResources().find((r) => sameResource(r, resource));
+    if (!match) {
+      throw new HttpException(
+        {
+          error: 'invalid_target',
+          error_description: 'resource is not an MCP resource of this server',
+        },
+        HttpStatus.BAD_REQUEST
+      );
+    }
+    return match;
+  }
+
+  // A new pair of an access token (1 h) and a refresh token (30 d), in the
+  // given family (a new one at code exchange, the same one on rotation)
+  private issueTokenFamily(
+    authorizationId: string,
+    scope: string,
+    resource: string | null,
+    familyId: string = makeSecureId(24)
+  ) {
+    const access = 'pos_' + makeSecureId(40);
+    const refresh = 'posr_' + makeSecureId(48);
+    const tokens = {
+      authorizationId,
+      familyId,
+      scope,
+      resource,
+      access: {
+        hash: hashToken(access),
+        expiresAt: new Date(Date.now() + accessTokenTtlMs),
+      },
+      refresh: {
+        hash: hashToken(refresh),
+        expiresAt: new Date(Date.now() + refreshTokenTtlMs),
+      },
+    };
+    return {
+      tokens,
+      response: {
+        access_token: access,
+        token_type: 'bearer',
+        expires_in: accessTokenTtlMs / 1000,
+        refresh_token: refresh,
+        scope,
+      },
+    };
+  }
+
   private refreshFields(app: Pick<OAuthApp, 'clientId'>, token: string) {
     if (app.clientId !== hubspotOAuthClientId()) {
       return {};
@@ -647,9 +851,22 @@ export class OAuthService {
     };
   }
 
-  // The refresh_token grant, HubSpot only (see refreshFields): the refresh
-  // token is looked up like an access token and handed back while it is valid
-  async refreshAccessToken(clientId?: string, refreshToken?: string) {
+  // The refresh_token grant. MCP (dynamic) clients rotate (refreshDynamic);
+  // HubSpot keeps its static flow (see refreshFields): the refresh token is
+  // looked up like an access token and handed back while it is valid
+  async refreshAccessToken(
+    clientId?: string,
+    refreshToken?: string,
+    clientSecret?: string,
+    resource?: string
+  ) {
+    const caller = clientId
+      ? await this._oauthRepository.getAppByClientId(clientId)
+      : null;
+    if (caller?.dynamic) {
+      return this.refreshDynamic(caller, refreshToken, clientSecret, resource);
+    }
+
     if (!clientId || clientId !== hubspotOAuthClientId()) {
       throw new HttpException(
         { error: 'unsupported_grant_type' },
@@ -764,7 +981,31 @@ export class OAuthService {
     return this._oauthRepository.deleteSelfHostedAuthorization(id);
   }
 
-  async getOrgByOAuthToken(token: string) {
+  // `resource` is where the token is being used (an MCP path), undefined for
+  // the public API and /api/mcp. A token bound to a resource works only there
+  async getOrgByOAuthToken(token: string, resource?: string) {
+    const rotating = await this._oauthRepository.findTokenByHash(
+      hashToken(token)
+    );
+    if (rotating) {
+      const grant = rotating.authorization;
+      if (
+        rotating.kind !== 'access' ||
+        rotating.revokedAt ||
+        rotating.expiresAt.getTime() <= Date.now() ||
+        grant.revokedAt ||
+        (rotating.resource &&
+          !(resource && sameResource(rotating.resource, resource))) ||
+        !(await this._oauthRepository.isActiveMember(
+          grant.userId,
+          grant.organizationId
+        ))
+      ) {
+        return null;
+      }
+      return grant;
+    }
+
     const encrypted = AuthService.fixedEncryption(token);
     const authorization = await this._oauthRepository.findByAccessToken(
       encrypted
