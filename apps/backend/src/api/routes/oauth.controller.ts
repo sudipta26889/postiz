@@ -150,14 +150,8 @@ export class OAuthController {
   @HttpCode(200)
   async token(
     @Body() body: TokenExchangeDto,
-    @Res({ passthrough: true }) res: Response,
     @Headers('authorization') authorization?: string
   ) {
-    // RFC 6749 §5.1: token responses must not be cached, errors included;
-    // set before anything can throw so the exception filter keeps them
-    res.setHeader('Cache-Control', 'no-store');
-    res.setHeader('Pragma', 'no-cache');
-
     // client_secret_basic puts the credentials in the Authorization header,
     // client_secret_post and public clients put them in the body
     const basic = extractBasicCredentials(authorization);
