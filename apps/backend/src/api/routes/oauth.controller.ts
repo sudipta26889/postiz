@@ -69,6 +69,9 @@ export class OAuthController {
   }
 
   @Get('/authorize')
+  // an unknown https client_id makes the server fetch its metadata (CIMD)
+  @UseGuards(ThrottlerRealIpGuard)
+  @Throttle({ default: { limit: 60, ttl: 60000 } })
   async authorize(@Query() query: AuthorizeOAuthQueryDto) {
     const app = await this._oauthService.validateAuthorizationRequest(
       query.client_id,
@@ -91,6 +94,11 @@ export class OAuthController {
         picture: app.picture,
         clientId: app.clientId,
         redirectUrl: app.redirectUrl,
+        // a metadata-document client's name is whatever it says: the host
+        // that publishes it is what the person can trust
+        publishedBy: app.clientId.startsWith('https://')
+          ? new URL(app.clientId).host
+          : undefined,
       },
       state: query.state,
       selfHosted,

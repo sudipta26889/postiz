@@ -25,13 +25,33 @@ const doc = (over: any = {}) => ({
   token_endpoint_auth_method: 'none',
   ...over,
 });
-const answer = (body: any, init: { status?: number; length?: number } = {}) => {
+// a response whose body streams in chunks, like a real one (optionally
+// without content-length, as a chunked response would be)
+const answer = (
+  body: any,
+  init: { status?: number; length?: number | null; chunks?: number } = {}
+) => {
   const text = typeof body === 'string' ? body : JSON.stringify(body);
+  const bytes = Buffer.from(text);
+  const parts = Math.max(1, init.chunks ?? 1);
+  const size = Math.ceil(bytes.length / parts);
   return {
     ok: (init.status ?? 200) < 400,
     status: init.status ?? 200,
-    headers: { get: (h: string) => (h === 'content-length' ? String(init.length ?? text.length) : null) },
-    arrayBuffer: async () => Buffer.from(text),
+    headers: {
+      get: (h: string) =>
+        h === 'content-length' && init.length !== null
+          ? String(init.length ?? bytes.length)
+          : null,
+    },
+    body: new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let i = 0; i < bytes.length; i += size) {
+          controller.enqueue(new Uint8Array(bytes.subarray(i, i + size)));
+        }
+        controller.close();
+      },
+    }),
   };
 };
 
@@ -48,6 +68,7 @@ const setup = (fetchAnswer: any) => {
   let stored: any = null;
   const repo = {
     getAppByClientId: jest.fn(async () => stored),
+    deleteStaleDynamicApps: jest.fn(async () => ({ count: 0 })),
     createDynamicApp: jest.fn(async (data: any) => {
       stored = { ...created, ...data, dynamic: true };
       return stored;
@@ -128,6 +149,8 @@ describe('CIMD: a client_id that is the URL of its own metadata', () => {
   it('treats an oversize, non-JSON, failing or unreachable document as an unknown client', async () => {
     for (const bad of [
       answer(doc(), { length: 70_000 }),
+      // chunked, no content-length, and over the cap: abandoned while reading
+      answer({ ...doc(), pad: 'x'.repeat(80_000) }, { length: null, chunks: 20 }),
       answer('not json'),
       answer(doc(), { status: 404 }),
       new Error('timeout'),
@@ -136,5 +159,27 @@ describe('CIMD: a client_id that is the URL of its own metadata', () => {
       expect(await errorOf(authorize(svc))).toMatchObject({ status: 400 });
       expect(repo.createDynamicApp).not.toHaveBeenCalled();
     }
+  });
+
+  it("accepts Claude Code's real document: loopback callbacks without a port, used on a random port", async () => {
+    const claudeCode = doc({
+      client_name: 'Claude Code',
+      redirect_uris: ['http://localhost/callback', 'http://127.0.0.1/callback'],
+    });
+    const { svc } = setup(answer(claudeCode));
+    await expect(authorize(svc, CLIENT, 'http://localhost:53682/callback')).resolves.toBeTruthy();
+    await expect(authorize(svc, CLIENT, 'http://127.0.0.1:41000/callback')).resolves.toBeTruthy();
+  });
+
+  it('lets only loopback http callbacks vary the port; path and host must still match', async () => {
+    const { svc } = setup(answer(doc({ redirect_uris: ['http://localhost/callback'] })));
+    expect(await errorOf(authorize(svc, CLIENT, 'http://localhost:5000/other'))).toMatchObject({ status: 400 });
+    expect(await errorOf(authorize(svc, CLIENT, 'http://evil.example:5000/callback'))).toMatchObject({ status: 400 });
+  });
+
+  it('needs a path in the client_id URL (a bare origin is not a metadata document)', async () => {
+    const { svc, fetchMock } = setup(answer(doc({ client_id: 'https://client.example/' })));
+    expect(await errorOf(authorize(svc, 'https://client.example/'))).toMatchObject({ status: 400 });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

@@ -34,6 +34,40 @@ const refreshTokenTtlMs = 30 * 24 * 60 * 60 * 1000;
 // two refreshes sent together by one client: the second one within this
 // window gets a new pair instead of being treated as a stolen-token replay
 const refreshGraceMs = 30 * 1000;
+// A registered redirect matches exactly, except that a loopback http
+// callback may use any port (RFC 8252 §7.3): native clients such as Claude
+// Code register http://localhost/callback and listen on a random port
+const isLoopbackHttp = (url: URL) =>
+  url.protocol === 'http:' &&
+  ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+const redirectAllowed = (registered: string[], requested: string) => {
+  if (registered.includes(requested)) {
+    return true;
+  }
+  let asked: URL;
+  try {
+    asked = new URL(requested);
+  } catch {
+    return false;
+  }
+  if (!isLoopbackHttp(asked)) {
+    return false;
+  }
+  return registered.some((uri) => {
+    try {
+      const known = new URL(uri);
+      return (
+        isLoopbackHttp(known) &&
+        known.hostname === asked.hostname &&
+        known.pathname === asked.pathname &&
+        known.search === asked.search
+      );
+    } catch {
+      return false;
+    }
+  });
+};
+
 const hashToken = (token: string) =>
   createHash('sha256').update(token).digest('hex');
 
@@ -242,6 +276,7 @@ export class OAuthService {
     }
     if (
       url.protocol !== 'https:' ||
+      url.pathname === '/' ||
       url.hash ||
       url.username ||
       url.password ||
@@ -249,6 +284,11 @@ export class OAuthService {
     ) {
       return null;
     }
+
+    // first sight of unknown clients creates rows: prune the abandoned ones
+    this._oauthRepository
+      .deleteStaleDynamicApps(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000))
+      .catch(() => {});
 
     let doc: any;
     try {
@@ -258,14 +298,31 @@ export class OAuthService {
         signal: AbortSignal.timeout(5000),
         headers: { accept: 'application/json' },
       } as any);
-      if (!res.ok || Number(res.headers.get('content-length') || 0) > 65536) {
+      if (
+        !res.ok ||
+        !res.body ||
+        Number(res.headers.get('content-length') || 0) > 65536
+      ) {
+        await res.body?.cancel().catch(() => {});
         return null;
       }
-      const body = await res.arrayBuffer();
-      if (body.byteLength > 65536) {
-        return null;
+      // the cap holds while reading, whatever the server declares (chunked)
+      const reader = res.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let size = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+        size += value.byteLength;
+        if (size > 65536) {
+          await reader.cancel().catch(() => {});
+          return null;
+        }
+        chunks.push(value);
       }
-      doc = JSON.parse(Buffer.from(body).toString('utf8'));
+      doc = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     } catch {
       return null;
     }
@@ -484,7 +541,7 @@ export class OAuthService {
     // except a public one (HubSpot), which has no secret and needs PKCE too
     if (app.dynamic) {
       const registered: string[] = JSON.parse(app.redirectUris || '[]');
-      if (!options?.redirectUri || !registered.includes(options.redirectUri)) {
+      if (!options?.redirectUri || !redirectAllowed(registered, options.redirectUri)) {
         throw new HttpException('Invalid redirect_uri', HttpStatus.BAD_REQUEST);
       }
     }

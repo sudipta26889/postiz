@@ -220,6 +220,11 @@ export const OAuthAuthorize: FC<{ logged: boolean }> = ({ logged }) => {
                 {appInfo.app.description}
               </div>
             )}
+            {appInfo.app.publishedBy && (
+              <div className="text-gray-400 text-center text-[13px]">
+                Client published by <b>{appInfo.app.publishedBy}</b>
+              </div>
+            )}
             {redirectHost && (
               <div className="text-gray-400 text-center text-[13px]">
                 You will be sent back to <b>{redirectHost}</b>
