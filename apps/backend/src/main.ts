@@ -22,9 +22,7 @@ import { startMcp } from '@gitroom/nestjs-libraries/chat/start.mcp';
 import { startApprovalSweep } from '@gitroom/nestjs-libraries/chat/human.approval';
 
 async function start() {
-  const app = await NestFactory.create(AppModule, {
-    rawBody: true,
-    cors: {
+  const defaultCors = {
       ...(!process.env.NOT_SECURED ? { credentials: true } : {}),
       allowedHeaders: [
         'Content-Type',
@@ -57,7 +55,32 @@ async function start() {
             ]
           : []),
       ],
-    },
+    };
+
+  const app = await NestFactory.create(AppModule, {
+    rawBody: true,
+    // The OAuth token and registration endpoints are called by browser-based
+    // MCP clients from any origin and never use cookies: `*` without
+    // credentials there; every other route keeps the allow-list above
+    cors: (req: any, callback: (err: Error | null, options?: any) => void) =>
+      callback(
+        null,
+        /^\/oauth\/(token|register)\/?(\?|$)/.test(req.url || '')
+          ? {
+              origin: '*',
+              credentials: false,
+              allowedHeaders: ['Content-Type', 'Authorization'],
+            }
+          : defaultCors
+      ),
+  });
+
+  // RFC 6749 5.1: no token response may be cached. Set before validation,
+  // so a 400 from the body validation carries it too
+  app.use('/oauth/token', (req: any, res: any, next: () => void) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Pragma', 'no-cache');
+    next();
   });
 
   await startMcp(app);

@@ -47,6 +47,38 @@ const oauthScopes = [
   'mcp:write',
 ];
 
+// Browser origins allowed to call the OAuth MCP endpoints: Claude, ChatGPT,
+// this Postiz, and any extra set in MCP_ALLOWED_ORIGINS (comma separated)
+const originOf = (value?: string) => {
+  try {
+    return value ? new URL(value).origin : undefined;
+  } catch {
+    return undefined;
+  }
+};
+const allowedMcpOrigins = [
+  'https://claude.ai',
+  'https://chatgpt.com',
+  // MCP Inspector in direct mode, as the backend CORS allow-list already has
+  'http://localhost:6274',
+  originOf(process.env.FRONTEND_URL),
+  originOf(process.env.MCP_URL),
+  ...(process.env.MCP_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((o) => originOf(o.trim())),
+].filter(Boolean) as string[];
+
+// Every protocol version the MCP clients we serve send (the server itself
+// negotiates 2026-07-28)
+const supportedMcpProtocolVersions = [
+  '2024-10-07',
+  '2024-11-05',
+  '2025-03-26',
+  '2025-06-18',
+  '2025-11-25',
+  '2026-07-28',
+];
+
 export const startMcp = async (app: INestApplication) => {
   const mastraService = app.get(MastraService, { strict: false });
   const organizationService = app.get(OrganizationService, { strict: false });
@@ -54,9 +86,14 @@ export const startMcp = async (app: INestApplication) => {
   const loadToolsService = app.get(LoadToolsService, { strict: false });
   const mcpRelayService = app.get(McpRelayService, { strict: false });
 
-  const resolveAuth = async (token: string) => {
+  // `resource`: the MCP path's canonical URL, so a token bound to another
+  // resource (RFC 8707) is refused here; undefined for /mcp and the API
+  const resolveAuth = async (token: string, resource?: string) => {
     if (token.startsWith('pos_')) {
-      const authorization = await oauthService.getOrgByOAuthToken(token);
+      const authorization = await oauthService.getOrgByOAuthToken(
+        token,
+        resource
+      );
       if (!authorization) return null;
       return authorization.organization;
     }
@@ -206,12 +243,14 @@ export const startMcp = async (app: INestApplication) => {
     '/mcp-oauth-chatgpt': {
       issuer: new URL('/mcp-oauth-chatgpt', process.env.NEXT_PUBLIC_BACKEND_URL!).toString(),
       registration: false,
-      refresh: false,
+      // a dynamic client here gets 1 h tokens (H2): it must see refresh
+      refresh: true,
     },
     '/mcp-oauth-dynamic': {
       issuer: new URL('/mcp-oauth-dynamic', process.env.NEXT_PUBLIC_BACKEND_URL!).toString(),
       registration: true,
-      refresh: false,
+      // MCP clients get rotating refresh tokens (design H2)
+      refresh: true,
     },
     ...(hubspotOAuthClientId
       ? {
@@ -254,10 +293,10 @@ export const startMcp = async (app: INestApplication) => {
         resource: new URL(mcpPath, process.env.NEXT_PUBLIC_BACKEND_URL!).toString(),
         authorizationServers: [authorizationServers[authorizationServer].issuer],
         scopesSupported: oauthScopes,
-        validateToken: async (token: string) => {
+        validateToken: async (token: string, resource?: string) => {
           const org = token.startsWith('psh_')
             ? await resolveSelfHosted(token)
-            : await resolveAuth(token);
+            : await resolveAuth(token, resource);
           if (!org) {
             return { valid: false, error: 'invalid_token', errorDescription: 'Invalid API Key or OAuth token' };
           }
@@ -374,6 +413,28 @@ export const startMcp = async (app: INestApplication) => {
       return;
     }
 
+    // A browser on another site must not drive this endpoint (MCP transport
+    // spec: validate Origin). Server-side clients (claude.ai, ChatGPT) send
+    // none; browser tools are allowed by MCP_ALLOWED_ORIGINS
+    const origin = req.headers.origin;
+    if (origin && !allowedMcpOrigins.includes(origin)) {
+      res.status(403).json({ error: 'forbidden', error_description: 'Origin not allowed' });
+      return;
+    }
+
+    // An MCP-Protocol-Version this server doesn't speak gets 400 (MCP spec)
+    const protocolVersion = req.headers['mcp-protocol-version'];
+    if (
+      typeof protocolVersion === 'string' &&
+      !supportedMcpProtocolVersions.includes(protocolVersion)
+    ) {
+      res.status(400).json({
+        error: 'invalid_request',
+        error_description: `Unsupported MCP-Protocol-Version ${protocolVersion}`,
+      });
+      return;
+    }
+
     // baseUrl is the mount path that matched, e.g. /mcp-oauth-claude
     const { middleware, mcpServer, selfHostedServer } = oauthResources[req.baseUrl];
     const url = new URL(req.baseUrl, process.env.NEXT_PUBLIC_BACKEND_URL);
@@ -385,7 +446,9 @@ export const startMcp = async (app: INestApplication) => {
     // a self-hosted connection has no organization here
     const selfHosted = token!.startsWith('psh_');
     const relay = selfHosted ? await resolveSelfHosted(token!) : undefined;
-    const auth = selfHosted ? undefined : await resolveAuth(token!);
+    const auth = selfHosted
+      ? undefined
+      : await resolveAuth(token!, url.toString());
     if (!auth && !(relay && selfHostedServer)) {
       res.status(401).json({ error: 'invalid_token', error_description: 'Could not resolve organization' });
       return;

@@ -18,6 +18,15 @@ const nextConfig = {
           },
         ],
       },
+      // The OAuth consent page approves access in the user's name: no other
+      // site may frame it (clickjacking)
+      {
+        source: '/oauth/:path*',
+        headers: [
+          { key: 'X-Frame-Options', value: 'DENY' },
+          { key: 'Content-Security-Policy', value: "frame-ancestors 'none'" },
+        ],
+      },
     ];
   },
   reactStrictMode: false,

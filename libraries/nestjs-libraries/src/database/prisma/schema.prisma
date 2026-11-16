@@ -1731,6 +1731,7 @@ model OAuthAuthorization {
   oauthApp            OAuthApp     @relation(fields: [oauthAppId], references: [id])
   user                User         @relation(fields: [userId], references: [id])
   organization        Organization @relation(fields: [organizationId], references: [id])
+  tokens              OAuthToken[]
 
   @@unique([oauthAppId, userId, organizationId])
   @@index([accessToken])
@@ -1739,6 +1740,29 @@ model OAuthAuthorization {
   @@index([userId])
   @@index([organizationId])
   @@index([revokedAt])
+}
+
+// Short-lived access tokens and rotating refresh tokens of MCP (dynamically
+// registered) clients. Only a sha256 of each token is stored. A refresh
+// token used twice (outside a short grace) revokes its whole family and the
+// grant. Static apps keep OAuthAuthorization.accessToken
+model OAuthToken {
+  id              String             @id @default(uuid())
+  authorizationId String
+  kind            String
+  tokenHash       String             @unique
+  familyId        String
+  scope           String
+  resource        String?
+  expiresAt       DateTime
+  usedAt          DateTime?
+  revokedAt       DateTime?
+  createdAt       DateTime           @default(now())
+  authorization   OAuthAuthorization @relation(fields: [authorizationId], references: [id])
+
+  @@index([authorizationId])
+  @@index([familyId])
+  @@index([expiresAt])
 }
 
 model OAuthSelfHostedAuthorization {

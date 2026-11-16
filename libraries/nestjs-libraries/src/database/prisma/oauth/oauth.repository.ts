@@ -1,13 +1,233 @@
 import { Injectable } from '@nestjs/common';
-import { PrismaRepository } from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
+import {
+  PrismaRepository,
+  PrismaTransaction,
+} from '@gitroom/nestjs-libraries/database/prisma/prisma.service';
 
 @Injectable()
 export class OAuthRepository {
   constructor(
     private _oauthApp: PrismaRepository<'oAuthApp'>,
     private _oauthAuth: PrismaRepository<'oAuthAuthorization'>,
-    private _oauthSelfHosted: PrismaRepository<'oAuthSelfHostedAuthorization'>
+    private _oauthSelfHosted: PrismaRepository<'oAuthSelfHostedAuthorization'>,
+    private _userOrganization: PrismaRepository<'userOrganization'>,
+    private _oauthToken: PrismaRepository<'oAuthToken'>,
+    private _transaction: PrismaTransaction
   ) {}
+
+  // --- Rotating tokens of MCP (dynamic) clients ---------------------------
+  // Consume an authorization code exactly once: only the first of two
+  // concurrent exchanges sees count 1
+  async consumeCode(id: string, encryptedCode: string) {
+    const { count } = await this._oauthAuth.model.oAuthAuthorization.updateMany({
+      where: { id, authorizationCode: encryptedCode },
+      data: {
+        authorizationCode: null,
+        codeExpiresAt: null,
+        codeChallenge: null,
+        codeChallengeMethod: null,
+        redirectUri: null,
+      },
+    });
+    return count === 1;
+  }
+
+  issueTokens(data: {
+    authorizationId: string;
+    familyId: string;
+    scope: string;
+    resource: string | null;
+    access: { hash: string; expiresAt: Date };
+    refresh: { hash: string; expiresAt: Date };
+  }) {
+    return this._oauthToken.model.oAuthToken.createMany({
+      data: [
+        {
+          authorizationId: data.authorizationId,
+          kind: 'access',
+          tokenHash: data.access.hash,
+          familyId: data.familyId,
+          scope: data.scope,
+          resource: data.resource,
+          expiresAt: data.access.expiresAt,
+        },
+        {
+          authorizationId: data.authorizationId,
+          kind: 'refresh',
+          tokenHash: data.refresh.hash,
+          familyId: data.familyId,
+          scope: data.scope,
+          resource: data.resource,
+          expiresAt: data.refresh.expiresAt,
+        },
+      ],
+    });
+  }
+
+  findTokenByHash(tokenHash: string) {
+    return this._oauthToken.model.oAuthToken.findUnique({
+      where: { tokenHash },
+      include: {
+        authorization: {
+          include: {
+            oauthApp: {
+              select: { id: true, clientId: true, dynamic: true, redirectUris: true },
+            },
+            user: { select: { id: true, email: true, activated: true } },
+            organization: {
+              include: {
+                subscription: {
+                  select: {
+                    subscriptionTier: true,
+                    totalChannels: true,
+                    isLifetime: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+  }
+
+  // Rotation in one transaction: the old refresh token is marked used only
+  // if nobody used it yet, and the new pair exists only if that succeeded
+  async rotateRefresh(
+    oldId: string,
+    next: Parameters<OAuthRepository['issueTokens']>[0]
+  ) {
+    return this._transaction.model.$transaction(async (tx) => {
+      const { count } = await tx.oAuthToken.updateMany({
+        where: { id: oldId, usedAt: null, revokedAt: null },
+        data: { usedAt: new Date() },
+      });
+      if (count !== 1) {
+        return false;
+      }
+      await tx.oAuthToken.createMany({
+        data: [
+          {
+            authorizationId: next.authorizationId,
+            kind: 'access',
+            tokenHash: next.access.hash,
+            familyId: next.familyId,
+            scope: next.scope,
+            resource: next.resource,
+            expiresAt: next.access.expiresAt,
+          },
+          {
+            authorizationId: next.authorizationId,
+            kind: 'refresh',
+            tokenHash: next.refresh.hash,
+            familyId: next.familyId,
+            scope: next.scope,
+            resource: next.resource,
+            expiresAt: next.refresh.expiresAt,
+          },
+        ],
+      });
+      return true;
+    });
+  }
+
+  // The one extra pair a client may get when it sent the same refresh
+  // twice at once: only while the old token is unrevoked and was used within
+  // the grace window, and it is then spent for good (revokedAt), in the same
+  // transaction as the new pair. A revoke or re-consent in between wins
+  async graceReissue(
+    oldId: string,
+    usedSince: Date,
+    next: Parameters<OAuthRepository['issueTokens']>[0]
+  ) {
+    return this._transaction.model.$transaction(async (tx) => {
+      const { count } = await tx.oAuthToken.updateMany({
+        where: { id: oldId, revokedAt: null, usedAt: { gte: usedSince } },
+        data: { revokedAt: new Date() },
+      });
+      if (count !== 1) {
+        return false;
+      }
+      await tx.oAuthToken.createMany({
+        data: [
+          {
+            authorizationId: next.authorizationId,
+            kind: 'access',
+            tokenHash: next.access.hash,
+            familyId: next.familyId,
+            scope: next.scope,
+            resource: next.resource,
+            expiresAt: next.access.expiresAt,
+          },
+          {
+            authorizationId: next.authorizationId,
+            kind: 'refresh',
+            tokenHash: next.refresh.hash,
+            familyId: next.familyId,
+            scope: next.scope,
+            resource: next.resource,
+            expiresAt: next.refresh.expiresAt,
+          },
+        ],
+      });
+      return true;
+    });
+  }
+
+  // Tokens long expired are of no use to anyone: kept 30 days for audit
+  pruneExpiredTokens(olderThan: Date) {
+    return this._oauthToken.model.oAuthToken.deleteMany({
+      where: { expiresAt: { lt: olderThan } },
+    });
+  }
+
+  // A refresh token replayed after it was spent: its family ends (not the
+  // grant, which a re-consent may have opened again with a new family)
+  revokeFamily(familyId: string) {
+    return this._oauthToken.model.oAuthToken.updateMany({
+      where: { familyId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+  }
+
+  // A replayed refresh token: every token of its family and the grant end
+  async revokeFamilyAndGrant(familyId: string, authorizationId: string) {
+    await this._transaction.model.$transaction([
+      this._oauthToken.model.oAuthToken.updateMany({
+        where: { familyId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      }),
+      this._oauthAuth.model.oAuthAuthorization.update({
+        where: { id: authorizationId },
+        data: { revokedAt: new Date() },
+        select: { id: true },
+      }),
+    ]);
+  }
+
+  // Re-consent or revoke: every earlier token of the grant ends
+  revokeTokensOfAuthorization(authorizationId: string) {
+    return this._oauthToken.model.oAuthToken.updateMany({
+      where: { authorizationId, revokedAt: null },
+      data: { revokedAt: new Date() },
+    });
+  }
+
+  // Whether the user who granted access still belongs to the organization:
+  // a removed or disabled member, a deleted user or a deleted organization
+  // ends every OAuth grant they made
+  async isActiveMember(userId: string, organizationId: string) {
+    return !!(await this._userOrganization.model.userOrganization.findFirst({
+      where: {
+        userId,
+        organizationId,
+        disabled: false,
+        user: { deletedAt: null, activated: true },
+        organization: { deletedAt: null },
+      },
+      select: { id: true },
+    }));
+  }
 
   getAppByOrgId(orgId: string) {
     return this._oauthApp.model.oAuthApp.findFirst({
@@ -203,6 +423,16 @@ export class OAuthRepository {
         authorizationCode: encryptedCode,
         revokedAt: null,
       },
+      include: { organization: { select: { paymentId: true } } },
+    });
+  }
+
+  // after a legacy (long-lived) token moved to a rotating family it stops
+  clearLegacyAccessToken(id: string) {
+    return this._oauthAuth.model.oAuthAuthorization.update({
+      where: { id },
+      data: { accessToken: null },
+      select: { id: true },
     });
   }
 

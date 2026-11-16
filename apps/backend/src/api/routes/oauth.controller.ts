@@ -30,6 +30,28 @@ import { extractBasicCredentials } from '@gitroom/nestjs-libraries/chat/oauth-ty
 import { McpRelayService } from '@gitroom/nestjs-libraries/chat/mcp.relay.service';
 import { ThrottlerRealIpGuard } from '@gitroom/nestjs-libraries/throttler/throttler.provider';
 
+// The origins the frontend is served from (the CORS allow-list's own)
+const isFrontendOrigin = (value?: string) => {
+  if (!value) {
+    return false;
+  }
+  let candidate: string;
+  try {
+    candidate = new URL(value).origin;
+  } catch {
+    return false;
+  }
+  return [process.env.FRONTEND_URL, process.env.MAIN_URL]
+    .filter(Boolean)
+    .some((allowed) => {
+      try {
+        return new URL(allowed!).origin === candidate;
+      } catch {
+        return false;
+      }
+    });
+};
+
 @ApiTags('OAuth')
 @Controller('/oauth')
 export class OAuthController {
@@ -135,12 +157,14 @@ export class OAuthController {
     const basic = extractBasicCredentials(authorization);
     const clientId = basic?.clientId || body.client_id;
 
-    // Only HubSpot gets refresh tokens, the service answers every other
-    // client with unsupported_grant_type, as before
+    // MCP (dynamic) clients rotate refresh tokens, HubSpot keeps its static
+    // refresh; every other client gets unsupported_grant_type, as before
     if (body.grant_type === 'refresh_token') {
       return this._oauthService.refreshAccessToken(
         clientId,
-        body.refresh_token
+        body.refresh_token,
+        basic?.clientSecret || body.client_secret,
+        body.resource
       );
     }
 
@@ -163,7 +187,8 @@ export class OAuthController {
       clientId,
       basic?.clientSecret || body.client_secret,
       body.code_verifier,
-      body.redirect_uri
+      body.redirect_uri,
+      body.resource
     );
   }
 
@@ -207,8 +232,20 @@ export class OAuthAuthorizedController {
   async approveOrDeny(
     @Body() body: ApproveOAuthDto,
     @GetUserFromRequest() user: User,
-    @GetOrgFromRequest() org: Organization
+    @GetOrgFromRequest() org: Organization,
+    @Headers('origin') origin?: string,
+    @Headers('referer') referer?: string
   ) {
+    // The session cookie alone authenticates this call, so a page on another
+    // site could post it (CSRF) and approve a client in the user's name: only
+    // the app's own frontend may approve or deny
+    if (!isFrontendOrigin(origin || referer)) {
+      throw new HttpException(
+        { error: 'invalid_request', error_description: 'Cross-site request refused' },
+        HttpStatus.FORBIDDEN
+      );
+    }
+
     const app = await this._oauthService.validateAuthorizationRequest(
       body.client_id,
       {

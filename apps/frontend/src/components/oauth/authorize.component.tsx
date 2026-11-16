@@ -22,6 +22,15 @@ export const OAuthAuthorize: FC<{ logged: boolean }> = ({ logged }) => {
   const codeChallenge = searchParams.get('code_challenge');
   const codeChallengeMethod = searchParams.get('code_challenge_method');
   const resource = searchParams.get('resource');
+  // The app's name is whatever the client registered: the host it returns to
+  // is what tells a look-alike apart
+  const redirectHost = (() => {
+    try {
+      return redirectUri ? new URL(redirectUri).host || redirectUri : null;
+    } catch {
+      return null;
+    }
+  })();
 
   useEffect(() => {
     if (!clientId || !responseType) {
@@ -93,6 +102,14 @@ export const OAuthAuthorize: FC<{ logged: boolean }> = ({ logged }) => {
 
         if (result.redirect) {
           window.location.href = result.redirect;
+        } else {
+          // refused (e.g. a cross-site request): say so instead of spinning
+          setError(
+            result.error_description ||
+              result.message ||
+              'Authorization refused'
+          );
+          setSubmitting(false);
         }
       } catch {
         setError('Failed to process authorization');
@@ -201,6 +218,11 @@ export const OAuthAuthorize: FC<{ logged: boolean }> = ({ logged }) => {
             {appInfo.app.description && (
               <div className="text-gray-400 text-center text-[14px]">
                 {appInfo.app.description}
+              </div>
+            )}
+            {redirectHost && (
+              <div className="text-gray-400 text-center text-[13px]">
+                You will be sent back to <b>{redirectHost}</b>
               </div>
             )}
           </div>
