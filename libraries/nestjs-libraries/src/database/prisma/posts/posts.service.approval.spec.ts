@@ -228,4 +228,57 @@ describe('approval duplicate decision (PostsService, G4 v3)', () => {
     const { service } = serviceWith([]);
     expect(await service.approvalEditCheck('org1', [], 'draft', 'fresh-group')).toEqual({ editable: [] });
   });
+
+  describe('approvalSaveCheck on real POST /public/v1/posts bodies', () => {
+    const group = { G: [{ id: 'q1', state: 'QUEUE' }, { id: 'pub1', state: 'PUBLISHED' }] };
+
+    it('refuses the reviewer\'s sequence: a draft item with posts[i].group = G and no ids', async () => {
+      const { service } = serviceWith([], [], group);
+      const body = {
+        type: 'draft',
+        date: '2026-12-01T10:00:00Z',
+        posts: [{ integration: { id: 'chan-1' }, group: 'G', value: [{ content: '<p>x</p>' }] }],
+      };
+      expect(await service.approvalSaveCheck('org1', body, 'draft')).toMatch(
+        /would delete post q1 \(QUEUE\), post pub1 \(PUBLISHED\) of group G.*Nothing was saved/
+      );
+    });
+
+    it('refuses two items sharing an existing group (the first save would delete the second\'s posts)', async () => {
+      const shared = { G: [{ id: 'a', state: 'QUEUE' }, { id: 'b', state: 'QUEUE' }] };
+      const { service } = serviceWith([], [{ id: 'a', state: 'QUEUE' }, { id: 'b', state: 'QUEUE' }], shared);
+      const body = {
+        type: 'schedule',
+        posts: [
+          { integration: { id: 'c1' }, group: 'G', value: [{ id: 'a', content: '<p>1</p>' }, { id: 'b', content: '<p>2</p>' }] },
+          { integration: { id: 'c2' }, group: 'G', value: [{ id: 'a', content: '<p>1</p>' }, { id: 'b', content: '<p>2</p>' }] },
+        ],
+      };
+      expect(await service.approvalSaveCheck('org1', body, 'request')).toMatch(
+        /Two posts in this request use the existing group G.*Nothing was filed/
+      );
+    });
+
+    it('accepts an edit that names every live post of its group (all queued/draft)', async () => {
+      const own = { G: [{ id: 'q1', state: 'QUEUE' }, { id: 'c1', state: 'QUEUE' }] };
+      const { service } = serviceWith([], [{ id: 'q1', state: 'QUEUE' }, { id: 'c1', state: 'QUEUE' }], own);
+      const body = {
+        type: 'update',
+        posts: [{ integration: { id: 'chan-1' }, group: 'G', value: [{ id: 'q1', content: '<p>x</p>' }, { id: 'c1', content: '<p>comment</p>' }] }],
+      };
+      expect(await service.approvalSaveCheck('org1', body, 'request')).toBeUndefined();
+    });
+
+    it('accepts an ordinary create (new groups, no ids), even several channels', async () => {
+      const { service } = serviceWith([]);
+      const body = {
+        type: 'now',
+        posts: [
+          { integration: { id: 'c1' }, group: 'new-1', value: [{ content: '<p>a</p>' }] },
+          { integration: { id: 'c2' }, group: 'new-2', value: [{ content: '<p>a</p>' }] },
+        ],
+      };
+      expect(await service.approvalSaveCheck('org1', body, 'request')).toBeUndefined();
+    });
+  });
 });

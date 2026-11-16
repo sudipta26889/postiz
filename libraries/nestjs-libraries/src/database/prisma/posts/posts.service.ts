@@ -631,6 +631,46 @@ export class PostsService {
     return { editable: found.map((p) => p.id) };
   }
 
+  // A public-API save (POST /public/v1/posts body) must not delete posts as
+  // a side effect. Each posts[i] is saved with its own `group`, and the save
+  // soft-deletes every live post of that group it doesn't name. So each item
+  // naming an existing group must name every live post in it (drafts or
+  // queued only), and two items may not share an existing group (the first
+  // save would delete the second's posts)
+  async approvalSaveCheck(
+    orgId: string,
+    body: any,
+    phase: 'request' | 'execute' | 'draft'
+  ): Promise<string | undefined> {
+    const posts: any[] = Array.isArray(body?.posts) ? body.posts : [];
+    const seen = new Set<string>();
+    for (const post of posts) {
+      const group = typeof post?.group === 'string' ? post.group : undefined;
+      const ids = (Array.isArray(post?.value) ? post.value : [])
+        .map((v: any) => v?.id)
+        .filter((id: unknown): id is string => typeof id === 'string' && !!id);
+      if (group) {
+        if (seen.has(group)) {
+          const live = await this._postRepository.getPostIdsInGroup(
+            orgId,
+            group
+          );
+          if (live.length) {
+            return `Two posts in this request use the existing group ${group}; saving the first would delete the second's posts. Send them in one item, or separately. Nothing was ${
+              phase === 'execute' ? 'posted' : phase === 'draft' ? 'saved' : 'filed'
+            }.`;
+          }
+        }
+        seen.add(group);
+      }
+      const edits = await this.approvalEditCheck(orgId, ids, phase, group);
+      if (edits.refuse) {
+        return edits.refuse;
+      }
+    }
+    return undefined;
+  }
+
   // A stored post as an approval item (a draft about to be scheduled)
   async approvalItemsOfPost(
     orgId: string,

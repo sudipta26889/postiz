@@ -167,15 +167,24 @@ export class PublicIntegrationsController implements OnModuleInit {
         this._postsService.approvalFingerprint(this.publishItems(args)),
       locks: (args, org) =>
         this._postsService.approvalLocks(org, this.publishItems(args)),
-      check: (args, org, phase, shown) =>
-        this._postsService.approvalDuplicateCheck(
+      check: async (args, org, phase, shown) => {
+        // never a delete as a side effect of the save, then the duplicates
+        const refuse = await this._postsService.approvalSaveCheck(
+          org,
+          args,
+          phase
+        );
+        if (refuse) {
+          return { refuse };
+        }
+        return this._postsService.approvalDuplicateCheck(
           org,
           this.publishItems(args),
           phase,
           shown,
-          this.editedPostIds(args),
-          typeof args?.group === 'string' ? args.group : undefined
-        ),
+          this.editedPostIds(args)
+        );
+      },
       channels: (args) =>
         this.publishItems(args).map((item) => item.integrationId),
     },
@@ -297,14 +306,13 @@ export class PublicIntegrationsController implements OnModuleInit {
     if (reason === null) {
       // a draft needs no approval, but it may not turn a post that already
       // went out back into a draft (which could then be scheduled again)
-      const edits = await this._postsService.approvalEditCheck(
+      const refuse = await this._postsService.approvalSaveCheck(
         org.id,
-        this.editedPostIds(rawBody),
-        'draft',
-        typeof rawBody?.group === 'string' ? rawBody.group : undefined
+        rawBody,
+        'draft'
       );
-      if (edits.refuse) {
-        throw new HttpException({ msg: edits.refuse }, 400);
+      if (refuse) {
+        throw new HttpException({ msg: refuse }, 400);
       }
       return this.runCreatePost(org, rawBody);
     }
