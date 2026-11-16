@@ -47,6 +47,35 @@ const oauthScopes = [
   'mcp:write',
 ];
 
+// Browser origins allowed to call the OAuth MCP endpoints: Claude, ChatGPT,
+// this Postiz, and any extra set in MCP_ALLOWED_ORIGINS (comma separated)
+const originOf = (value?: string) => {
+  try {
+    return value ? new URL(value).origin : undefined;
+  } catch {
+    return undefined;
+  }
+};
+const allowedMcpOrigins = [
+  'https://claude.ai',
+  'https://chatgpt.com',
+  originOf(process.env.FRONTEND_URL),
+  originOf(process.env.MCP_URL),
+  ...(process.env.MCP_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((o) => originOf(o.trim())),
+].filter(Boolean) as string[];
+
+// Every protocol version the MCP clients we serve send (the server itself
+// negotiates 2026-07-28)
+const supportedMcpProtocolVersions = [
+  '2024-11-05',
+  '2025-03-26',
+  '2025-06-18',
+  '2025-11-25',
+  '2026-07-28',
+];
+
 export const startMcp = async (app: INestApplication) => {
   const mastraService = app.get(MastraService, { strict: false });
   const organizationService = app.get(OrganizationService, { strict: false });
@@ -371,6 +400,28 @@ export const startMcp = async (app: INestApplication) => {
     // Skip if this is the /mcp/:id route
     if (req.path !== '/' && req.path !== '') {
       next();
+      return;
+    }
+
+    // A browser on another site must not drive this endpoint (MCP transport
+    // spec: validate Origin). Server-side clients (claude.ai, ChatGPT) send
+    // none; browser tools are allowed by MCP_ALLOWED_ORIGINS
+    const origin = req.headers.origin;
+    if (origin && !allowedMcpOrigins.includes(origin)) {
+      res.status(403).json({ error: 'forbidden', error_description: 'Origin not allowed' });
+      return;
+    }
+
+    // An MCP-Protocol-Version this server doesn't speak gets 400 (MCP spec)
+    const protocolVersion = req.headers['mcp-protocol-version'];
+    if (
+      typeof protocolVersion === 'string' &&
+      !supportedMcpProtocolVersions.includes(protocolVersion)
+    ) {
+      res.status(400).json({
+        error: 'invalid_request',
+        error_description: `Unsupported MCP-Protocol-Version ${protocolVersion}`,
+      });
       return;
     }
 
