@@ -590,8 +590,29 @@ export class PostsService {
   async approvalEditCheck(
     orgId: string,
     ids: string[],
-    phase: 'request' | 'execute' | 'draft' = 'request'
+    phase: 'request' | 'execute' | 'draft' = 'request',
+    // saving into an existing group deletes every post of the group the save
+    // doesn't name: that would be a delete without approval, so the save must
+    // name them all (a delete goes through the approved delete route)
+    group?: string
   ): Promise<{ refuse?: string; editable: string[] }> {
+    const nothing =
+      phase === 'execute' ? 'posted' : phase === 'draft' ? 'saved' : 'filed';
+    if (group) {
+      const inGroup = await this._postRepository.getPostIdsInGroup(
+        orgId,
+        group
+      );
+      const dropped = inGroup.filter((p) => !ids.includes(p.id));
+      if (dropped.length) {
+        return {
+          editable: [],
+          refuse: `This would delete ${dropped
+            .map((p) => `post ${p.id} (${p.state})`)
+            .join(', ')} of group ${group}, which it doesn't include. Deleting needs the approved delete route. Nothing was ${nothing}.`,
+        };
+      }
+    }
     if (!ids.length) {
       return { editable: [] };
     }
@@ -604,9 +625,7 @@ export class PostsService {
         editable: [],
         refuse: `This edits ${refused
           .map((p) => `post ${p.id} (${p.state})`)
-          .join(', ')}, which already went out or failed; editing it would post it again. Nothing was ${
-          phase === 'execute' ? 'posted' : phase === 'draft' ? 'saved' : 'filed'
-        }.`,
+          .join(', ')}, which already went out or failed; editing it would post it again. Nothing was ${nothing}.`,
       };
     }
     return { editable: found.map((p) => p.id) };
@@ -661,7 +680,9 @@ export class PostsService {
     phase: 'request' | 'execute',
     shown: string[] = [],
     // posts being edited (an update of a queued post must not match itself)
-    excludePostIds: string[] = []
+    excludePostIds: string[] = [],
+    // the group a save goes into (see approvalEditCheck)
+    group?: string
   ): Promise<{ refuse?: string; warn?: string; shown?: string[] }> {
     if (!items.length) {
       return {};
@@ -669,7 +690,12 @@ export class PostsService {
 
     // only this org's verified drafts and queued posts are left out of the
     // duplicate search
-    const edits = await this.approvalEditCheck(orgId, excludePostIds, phase);
+    const edits = await this.approvalEditCheck(
+      orgId,
+      excludePostIds,
+      phase,
+      group
+    );
     if (edits.refuse) {
       return { refuse: edits.refuse };
     }

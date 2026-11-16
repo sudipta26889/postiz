@@ -1281,6 +1281,15 @@ export class PostsRepository {
     });
   }
 
+  // The live posts already in a group (this org): saving into the group
+  // replaces them, so they must all be named by the save
+  getPostIdsInGroup(orgId: string, group: string) {
+    return this._post.model.post.findMany({
+      where: { organizationId: orgId, group, deletedAt: null },
+      select: { id: true, state: true },
+    });
+  }
+
   // The state of posts a request says it edits (this org only)
   getPostStates(orgId: string, ids: string[]) {
     return this._post.model.post.findMany({

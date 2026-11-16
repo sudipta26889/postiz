@@ -173,7 +173,8 @@ export class PublicIntegrationsController implements OnModuleInit {
           this.publishItems(args),
           phase,
           shown,
-          this.editedPostIds(args)
+          this.editedPostIds(args),
+          typeof args?.group === 'string' ? args.group : undefined
         ),
       channels: (args) =>
         this.publishItems(args).map((item) => item.integrationId),
@@ -299,7 +300,8 @@ export class PublicIntegrationsController implements OnModuleInit {
       const edits = await this._postsService.approvalEditCheck(
         org.id,
         this.editedPostIds(rawBody),
-        'draft'
+        'draft',
+        typeof rawBody?.group === 'string' ? rawBody.group : undefined
       );
       if (edits.refuse) {
         throw new HttpException({ msg: edits.refuse }, 400);

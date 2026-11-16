@@ -30,13 +30,18 @@ const { PostsService } = require('@gitroom/nestjs-libraries/database/prisma/post
 
 // PostsService has many collaborators; the duplicate decision only needs the
 // repository read, so it is tested on a bare instance
-const serviceWith = (posts: any[], states: { id: string; state: string }[] = []) => {
+const serviceWith = (
+  posts: any[],
+  states: { id: string; state: string }[] = [],
+  groups: Record<string, { id: string; state: string }[]> = {}
+) => {
   const service = Object.create(PostsService.prototype);
   const getRecentChannelPosts = jest.fn(async () => posts);
   const getPostStates = jest.fn(async (_org: string, ids: string[]) =>
     states.filter((p) => ids.includes(p.id))
   );
-  (service as any)._postRepository = { getRecentChannelPosts, getPostStates };
+  const getPostIdsInGroup = jest.fn(async (_org: string, group: string) => groups[group] || []);
+  (service as any)._postRepository = { getRecentChannelPosts, getPostStates, getPostIdsInGroup };
   return { service, getRecentChannelPosts, getPostStates };
 };
 
@@ -201,5 +206,26 @@ describe('approval duplicate decision (PostsService, G4 v3)', () => {
     expect(await service.approvalEditCheck('org1', ['p-q', 'p-d', 'brand-new'], 'draft')).toEqual({
       editable: ['p-q', 'p-d'],
     });
+  });
+
+  it('refuses a save into an existing group that would delete the posts it does not name', async () => {
+    const group = { G: [{ id: 'q1', state: 'QUEUE' }, { id: 'pub1', state: 'PUBLISHED' }] };
+    const { service } = serviceWith([], [], group);
+    // a "draft" with group G and no ids: saving it would delete q1 and pub1
+    const edits = await service.approvalEditCheck('org1', [], 'draft', 'G');
+    expect(edits.refuse).toMatch(/would delete post q1 \(QUEUE\), post pub1 \(PUBLISHED\) of group G.*approved delete route.*Nothing was saved/);
+  });
+
+  it('allows a save into a group that names every post in it (a real edit of drafts/queued posts)', async () => {
+    const group = { G: [{ id: 'q1', state: 'QUEUE' }, { id: 'd1', state: 'DRAFT' }] };
+    const { service } = serviceWith([], [{ id: 'q1', state: 'QUEUE' }, { id: 'd1', state: 'DRAFT' }], group);
+    expect(await service.approvalEditCheck('org1', ['q1', 'd1'], 'draft', 'G')).toEqual({
+      editable: ['q1', 'd1'],
+    });
+  });
+
+  it('a new group (nothing in it) is an ordinary create', async () => {
+    const { service } = serviceWith([]);
+    expect(await service.approvalEditCheck('org1', [], 'draft', 'fresh-group')).toEqual({ editable: [] });
   });
 });
