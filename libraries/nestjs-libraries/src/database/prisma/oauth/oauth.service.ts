@@ -798,6 +798,48 @@ export class OAuthService {
     return response;
   }
 
+  // RFC 7009: a client revokes one of its own tokens. The client
+  // authenticates like at /token; whatever the token is (unknown, expired,
+  // someone else's), the answer is the same 200, so nothing leaks. A rotating
+  // token ends its family, a legacy long-lived one its grant
+  async revokeToken(clientId?: string, clientSecret?: string, token?: string) {
+    const app = clientId
+      ? await this._oauthRepository.getAppByClientId(clientId)
+      : null;
+    if (
+      !app ||
+      (!this.isPublicClient(app) &&
+        (!clientSecret ||
+          !app.clientSecret ||
+          app.clientSecret !== AuthService.fixedEncryption(clientSecret)))
+    ) {
+      throw new HttpException(
+        { error: 'invalid_client' },
+        HttpStatus.UNAUTHORIZED
+      );
+    }
+    if (!token) {
+      return;
+    }
+
+    const rotating = await this._oauthRepository.findTokenByHash(
+      hashToken(token)
+    );
+    if (rotating) {
+      if (rotating.authorization.oauthAppId === app.id) {
+        await this._oauthRepository.revokeFamily(rotating.familyId);
+      }
+      return;
+    }
+
+    const legacy = await this._oauthRepository.findByAccessToken(
+      AuthService.fixedEncryption(token)
+    );
+    if (legacy && legacy.oauthAppId === app.id) {
+      await this._oauthRepository.revokeAuthorizationById(legacy.id);
+    }
+  }
+
   // RFC 8707: a token is bound to the MCP resource it was asked for; any
   // other resource is invalid_target
   private checkResource(resource?: string) {

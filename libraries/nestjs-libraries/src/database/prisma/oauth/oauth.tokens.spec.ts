@@ -55,6 +55,7 @@ const repoWith = (over: any = {}) => ({
   isActiveMember: jest.fn(async () => true),
   findByAccessToken: jest.fn(async () => null),
   clearLegacyAccessToken: jest.fn(async () => ({ id: 'auth1' })),
+  revokeAuthorizationById: jest.fn(async () => ({ id: 'auth1' })),
   createAuthorization: jest.fn(async () => ({ id: 'auth1' })),
   revokeTokensOfAuthorization: jest.fn(async () => ({ count: 0 })),
   ...over,
@@ -284,5 +285,51 @@ describe('using a rotating access token', () => {
     const legacy = { ...grant, id: 'auth-legacy' };
     const repo = repoWith({ findByAccessToken: jest.fn(async () => legacy) });
     expect(await service(repo).getOrgByOAuthToken('pos_old')).toBe(legacy);
+  });
+});
+
+describe('RFC 7009 revocation', () => {
+  const row = (over: any = {}) => ({
+    id: 't1',
+    kind: 'refresh',
+    familyId: 'fam1',
+    authorization: grant,
+    ...over,
+  });
+
+  it('a client revoking its rotating token ends the whole family', async () => {
+    const repo = repoWith({ findTokenByHash: jest.fn(async () => row()) });
+    await service(repo).revokeToken('pca_dyn', undefined, 'posr_x');
+    expect(repo.revokeFamily).toHaveBeenCalledWith('fam1');
+  });
+
+  it('a legacy long-lived token ends its grant', async () => {
+    const repo = repoWith({ findByAccessToken: jest.fn(async () => ({ ...grant, id: 'auth-legacy' })) });
+    await service(repo).revokeToken('pca_dyn', undefined, 'pos_old');
+    expect(repo.revokeAuthorizationById).toHaveBeenCalledWith('auth-legacy');
+  });
+
+  it("never touches another client's token, and answers the same way", async () => {
+    const repo = repoWith({
+      findTokenByHash: jest.fn(async () => row({ authorization: { ...grant, oauthAppId: 'other' } })),
+    });
+    await expect(service(repo).revokeToken('pca_dyn', undefined, 'posr_x')).resolves.toBeUndefined();
+    expect(repo.revokeFamily).not.toHaveBeenCalled();
+  });
+
+  it('an unknown token is fine (200, nothing done)', async () => {
+    const repo = repoWith();
+    await expect(service(repo).revokeToken('pca_dyn', undefined, 'nope')).resolves.toBeUndefined();
+    expect(repo.revokeFamily).not.toHaveBeenCalled();
+    expect(repo.revokeAuthorizationById).not.toHaveBeenCalled();
+  });
+
+  it('a confidential client must authenticate; an unknown client is refused', async () => {
+    const repo = repoWith({
+      getAppByClientId: jest.fn(async () => ({ ...dynamicPublic, tokenEndpointAuthMethod: 'client_secret_post', clientSecret: 'enc(s)' })),
+    });
+    expect(await errorOf(service(repo).revokeToken('pca_dyn', undefined, 'posr_x'))).toMatchObject({ status: 401 });
+    const none = repoWith({ getAppByClientId: jest.fn(async () => null) });
+    expect(await errorOf(service(none).revokeToken('nope', undefined, 'x'))).toMatchObject({ status: 401 });
   });
 });

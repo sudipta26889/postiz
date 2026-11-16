@@ -269,6 +269,13 @@ export const startMcp = async (app: INestApplication) => {
     issuer: server.issuer,
     authorization_endpoint: `${process.env.FRONTEND_URL}/oauth/authorize`,
     token_endpoint: `${backendUrl}/oauth/token`,
+    // RFC 7009: clients cancel their tokens when the user disconnects
+    revocation_endpoint: `${backendUrl}/oauth/revoke`,
+    revocation_endpoint_auth_methods_supported: [
+      'client_secret_basic',
+      'client_secret_post',
+      'none',
+    ],
     ...(server.registration && {
       registration_endpoint: `${backendUrl}/oauth/register`,
     }),

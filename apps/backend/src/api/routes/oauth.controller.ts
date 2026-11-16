@@ -24,6 +24,7 @@ import {
   AuthorizeSelfHostedDto,
 } from '@gitroom/nestjs-libraries/dtos/oauth/authorize-oauth.dto';
 import { TokenExchangeDto } from '@gitroom/nestjs-libraries/dtos/oauth/token-exchange.dto';
+import { RevokeTokenDto } from '@gitroom/nestjs-libraries/dtos/oauth/revoke-token.dto';
 import { RegisterClientDto } from '@gitroom/nestjs-libraries/dtos/oauth/register-client.dto';
 import { HubspotInstallQueryDto } from '@gitroom/nestjs-libraries/dtos/oauth/hubspot-install.dto';
 import { extractBasicCredentials } from '@gitroom/nestjs-libraries/chat/oauth-types';
@@ -190,6 +191,22 @@ export class OAuthController {
       body.redirect_uri,
       body.resource
     );
+  }
+
+  // RFC 7009: always 200 for an authenticated client, whatever the token
+  @Post('/revoke')
+  @HttpCode(200)
+  async revoke(
+    @Body() body: RevokeTokenDto,
+    @Headers('authorization') authorization?: string
+  ) {
+    const basic = extractBasicCredentials(authorization);
+    await this._oauthService.revokeToken(
+      basic?.clientId || body.client_id,
+      basic?.clientSecret || body.client_secret,
+      body.token
+    );
+    return {};
   }
 
   @Get('/userinfo')
