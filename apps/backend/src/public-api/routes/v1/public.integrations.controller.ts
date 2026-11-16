@@ -619,17 +619,26 @@ export class PublicIntegrationsController {
     @Param('id') id: string
   ) {
     Sentry.metrics.count('public_api-request', 1);
-    const isTherePosts = await this._integrationService.getPostsForChannel(
-      org.id,
-      id
-    );
-    if (isTherePosts.length) {
-      for (const post of isTherePosts) {
-        this._postsService.deletePost(org.id, post.group).catch(() => {});
-      }
-    }
+    // deleting a channel deletes its posts too: a human approves it (DharaHIL)
+    return publicApproval.run({
+      action: 'public.integrations.delete',
+      org: org.id,
+      args: { id },
+      reason: 'Deleting a channel and its posts cannot be undone',
+      execute: async (args) => {
+        const isTherePosts = await this._integrationService.getPostsForChannel(
+          org.id,
+          args.id
+        );
+        if (isTherePosts.length) {
+          for (const post of isTherePosts) {
+            this._postsService.deletePost(org.id, post.group).catch(() => {});
+          }
+        }
 
-    return this._integrationService.deleteChannel(org.id, id);
+        return this._integrationService.deleteChannel(org.id, args.id);
+      },
+    });
   }
 
   @Get('/integration-settings/:id')
