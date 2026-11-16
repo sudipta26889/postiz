@@ -18,9 +18,9 @@ const setup = (answers: any[], hasRedis = true) => {
   const gate = createApprovalGate({
     fetch: (async () => queue.shift() ?? json({})) as any,
     redis: {
-      get: async (k: string) => data.get(k) ?? null,
+      get: async (k: string) => (k.endsWith(':index') ? ((globalThis as any).__sets ?? {})[k] ?? null : data.get(k) ?? null),
       // the lock release script: delete only if the token still matches
-      eval: async (_script: string, _n: number, k: string, token: string) => (data.get(k) === token ? (data.delete(k), 1) : 0),
+      eval: async (script: string, _n: number, k: string, arg: string) => { const g = ((globalThis as any).__sets ??= {}); if (script.includes('table.insert(t, ARGV[1])')) { const list: string[] = JSON.parse(g[k] ?? '[]'); if (list.includes(arg)) return 0; list.push(arg); g[k] = JSON.stringify(list); return 1; } if (script.includes('x ~= ARGV[1]')) { const list: string[] = JSON.parse(g[k] ?? '[]'); g[k] = JSON.stringify(list.filter((x) => x !== arg)); return 1; } return data.get(k) === arg ? (data.delete(k), 1) : 0; },
       set: async (k: string, v: string, ...o: any[]) => {
         if (o.includes('NX') && data.has(k)) return null;
         data.set(k, v);
@@ -135,7 +135,8 @@ describe('decide returns a transport-neutral decision', () => {
   });
 
   it('releases the claim when the action fails before any side effect', async () => {
-    const { gate, data } = setup([created, approved, approved]);
+    // the failure is reported to DharaHIL (executed: false), then retried
+    const { gate, data } = setup([created, approved, json({}), approved]);
     const execute = jest
       .fn()
       .mockRejectedValueOnce(new Error('not found'))
@@ -205,7 +206,7 @@ describe('sweep: Postiz carries out an approved action itself', () => {
     await gate.decide(input(jest.fn()));
     await gate.sweep();
     expect(run).not.toHaveBeenCalled();
-    expect(JSON.parse((globalThis as any).__sets['hil:pending'])).toEqual(['req1']);
+    expect(JSON.parse((globalThis as any).__sets['hil:pending:index'])).toEqual(['req1']);
   });
 
   it('drops a rejected request without running it', async () => {
@@ -215,7 +216,7 @@ describe('sweep: Postiz carries out an approved action itself', () => {
     await gate.decide(input(jest.fn()));
     await gate.sweep();
     expect(run).not.toHaveBeenCalled();
-    expect(JSON.parse((globalThis as any).__sets['hil:pending'])).toEqual([]);
+    expect(JSON.parse((globalThis as any).__sets['hil:pending:index'])).toEqual([]);
   });
 
   it('never runs an approval twice: an agent repeating the call afterwards gets "already done"', async () => {
@@ -260,11 +261,11 @@ describe('sweep robustness', () => {
     gate.registerExecutor('public.posts.delete', { execute: run });
     await gate.decide(input(jest.fn()));
     // a corrupt entry next to the good one
-    (globalThis as any).__sets['hil:pending'] = JSON.stringify(['bad', 'req1']);
+    (globalThis as any).__sets['hil:pending:index'] = JSON.stringify(['bad', 'req1']);
     data.set('hil:pending:bad', '{not json');
     await gate.sweep();
     expect(run).toHaveBeenCalledTimes(1);
-    expect(JSON.parse((globalThis as any).__sets['hil:pending'])).toEqual([]);
+    expect(JSON.parse((globalThis as any).__sets['hil:pending:index'])).toEqual([]);
   });
 });
 
@@ -281,9 +282,8 @@ describe('duplicate guard (G4 v3)', () => {
     const gate = createApprovalGate({
       fetch: fetch as any,
       redis: {
-        get: async (k: string) => data.get(k) ?? null,
-        eval: async (_s: string, _n: number, k: string, token: string) =>
-          data.get(k) === token ? (data.delete(k), 1) : 0,
+        get: async (k: string) => (k.endsWith(':index') ? ((globalThis as any).__sets ?? {})[k] ?? null : data.get(k) ?? null),
+        eval: async (script: string, _n: number, k: string, arg: string) => { const g = ((globalThis as any).__sets ??= {}); if (script.includes('table.insert(t, ARGV[1])')) { const list: string[] = JSON.parse(g[k] ?? '[]'); if (list.includes(arg)) return 0; list.push(arg); g[k] = JSON.stringify(list); return 1; } if (script.includes('x ~= ARGV[1]')) { const list: string[] = JSON.parse(g[k] ?? '[]'); g[k] = JSON.stringify(list.filter((x) => x !== arg)); return 1; } return data.get(k) === arg ? (data.delete(k), 1) : 0; },
         set: async (k: string, v: string, ...o: any[]) => {
           if (o.includes('NX') && data.has(k)) return null;
           data.set(k, v);
@@ -397,7 +397,7 @@ describe('duplicate guard (G4 v3)', () => {
     await gate.sweep();
     expect(run).not.toHaveBeenCalled();
     expect(reportedNotExecuted()).toHaveLength(1);
-    expect(JSON.parse((globalThis as any).__sets['hil:pending'])).toEqual([]);
+    expect(JSON.parse((globalThis as any).__sets['hil:pending:index'])).toEqual([]);
   });
 
   it('waits (never runs, never refuses) while another run holds the lock', async () => {
@@ -409,13 +409,96 @@ describe('duplicate guard (G4 v3)', () => {
     data.set('hil:lock:post:org1:loose-1', 'someone-else');
     await gate.sweep();
     expect(run).not.toHaveBeenCalled();
-    expect(JSON.parse((globalThis as any).__sets['hil:pending'])).toEqual(['req1']);
+    expect(JSON.parse((globalThis as any).__sets['hil:pending:index'])).toEqual(['req1']);
 
     data.delete('hil:lock:post:org1:loose-1');
     await gate.sweep();
     expect(run).toHaveBeenCalledTimes(1);
     // our lock is released afterwards
     expect(data.has('hil:lock:post:org1:loose-1')).toBe(false);
+  });
+
+  it('tells the organization once when a request expires, and the agent on its next call', async () => {
+    const created2 = json({ request_id: 'req2', version: 1, status: 'PENDING', expires_at: expiresAt });
+    const { gate, filed } = guardedSetup([created, json({ status: 'EXPIRED' }), json({ status: 'EXPIRED' }), created2]);
+    const notify = jest.fn(async () => undefined);
+    gate.registerNotifier(notify);
+    gate.registerExecutor('public.posts.create', { execute: jest.fn(), guard: guard() });
+
+    await gate.decide(postInput(guard()));
+    await gate.sweep();
+    await gate.sweep();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][1]).toMatch(/expired without approval/);
+
+    // the agent checks: it learns the outcome, nothing is filed
+    const check = await gate.decide(postInput(guard()));
+    expect(check.status).toBe('refused');
+    expect((check as any).message).toMatch(/not approved \(EXPIRED\).*files a new request/);
+    expect(filed()).toHaveLength(1);
+
+    // asking again after that files a new request
+    expect((await gate.decide(postInput(guard()))).requestId).toBe('req2');
+    expect(filed()).toHaveLength(2);
+  });
+
+  it('does not notify about a request the owner rejected', async () => {
+    const { gate } = guardedSetup([created, json({ status: 'REJECTED' })]);
+    const notify = jest.fn(async () => undefined);
+    gate.registerNotifier(notify);
+    gate.registerExecutor('public.posts.create', { execute: jest.fn(), guard: guard() });
+    await gate.decide(postInput(guard()));
+    await gate.sweep();
+    expect(notify).not.toHaveBeenCalled();
+  });
+
+  it('tells the organization when an approved action is refused at execution', async () => {
+    const { gate } = guardedSetup([created, approvedPost(), json({})]);
+    const notify = jest.fn(async () => undefined);
+    gate.registerNotifier(notify);
+    const g = guard({ execute: { refuse: 'This exact post already exists: post X.' } });
+    gate.registerExecutor('public.posts.create', { execute: jest.fn(), guard: g });
+    await gate.decide(postInput(g));
+    await gate.sweep();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][2]).toMatch(/approved but not carried out: This exact post already exists/);
+  });
+
+  it('after a crash, answers from its own claim and never calls itself a duplicate', async () => {
+    const { gate, data } = guardedSetup([created, approvedPost()]);
+    const run = jest.fn();
+    const g = guard({ execute: { refuse: 'would find its own post' } });
+    gate.registerExecutor('public.posts.create', { execute: run, guard: g });
+    await gate.decide(postInput(g));
+    data.set('hil:exec:req1', 'running');
+    await gate.sweep();
+    expect(g.check).not.toHaveBeenCalledWith(expect.anything(), 'org1', 'execute', expect.anything());
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it('reports a no-op (the action refused its arguments) instead of dropping it', async () => {
+    const { gate, reportedNotExecuted } = guardedSetup([created, approvedPost(), json({})]);
+    const notify = jest.fn(async () => undefined);
+    gate.registerNotifier(notify);
+    gate.registerExecutor('public.posts.create', {
+      execute: jest.fn(async () => ({ output: { errors: 'channel is disconnected' } })),
+      isNoop: (r: any) => !!r?.output?.errors,
+      guard: guard(),
+    });
+    await gate.decide(postInput(guard()));
+    await gate.sweep();
+    expect(reportedNotExecuted()).toHaveLength(1);
+    expect(notify.mock.calls[0][2]).toMatch(/channel is disconnected/);
+  });
+
+  it('warns about a different request still waiting for the same channel', async () => {
+    const created2 = json({ request_id: 'req2', version: 1, status: 'PENDING', expires_at: expiresAt });
+    const { gate, filed } = guardedSetup([created, created2]);
+    const onChannel = (fp: string) => ({ ...guard({ fingerprint: fp }), channels: () => ['chan-1'] });
+    await gate.decide(postInput(onChannel('fp-1'), { text: 'first' }));
+    await gate.decide(postInput(onChannel('fp-2'), { text: 'second' }));
+    const second = JSON.parse((filed()[1] as any)[1].body);
+    expect(second.context_summary).toMatch(/^⚠ Possible duplicate of pending request req1/);
   });
 
   it('decides with what the approver was shown, and runs the args they saw', async () => {
@@ -428,5 +511,54 @@ describe('duplicate guard (G4 v3)', () => {
     expect(g.check).toHaveBeenLastCalledWith({ text: 'as filed' }, 'org1', 'execute', ['X']);
     // no approved_args from DharaHIL: the stored, filed args run
     expect(run).toHaveBeenCalledWith('org1', { text: 'as filed' });
+  });
+});
+
+describe('Redis self-test (no silent failure)', () => {
+  const gateWith = (evalImpl: any) => {
+    const data = new Map<string, string>();
+    return createApprovalGate({
+      fetch: (async () => json({})) as any,
+      redis: {
+        get: async (k: string) => data.get(k) ?? null,
+        set: async (k: string, v: string, ...o: any[]) => {
+          if (o.includes('NX') && data.has(k)) return null;
+          data.set(k, v);
+          return 'OK';
+        },
+        del: async (k: string) => (data.delete(k) ? 1 : 0),
+        expire: async () => 1,
+        eval: evalImpl(data),
+      } as any,
+      hasRedis: () => true,
+      config: () => ({ baseUrl: 'https://hil', tenantId: 't', appId: 'a', apiKey: 'k' }),
+    });
+  };
+
+  it('passes when every operation the gate needs works', async () => {
+    const gate = gateWith((data: Map<string, string>) => async (script: string, _n: number, k: string, arg: string) =>
+      script.includes('ARGV[1] then return redis.call')
+        ? data.get(k) === arg ? (data.delete(k), 1) : 0
+        : 1
+    );
+    expect(await gate.selfTest()).toBeUndefined();
+  });
+
+  it('when Redis refuses a command, says why and refuses gated actions (503), never silently', async () => {
+    const gate = gateWith(() => async () => {
+      throw new Error("NOPERM this user has no permissions to run the 'eval' command");
+    });
+    const error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    expect(await gate.selfTest()).toMatch(/approval queue unavailable.*NOPERM/);
+    const decision = await gate.decide({
+      action: 'deletePostTool',
+      org: 'org1',
+      args: { id: 'p1' },
+      reason: 'Deleting a post',
+      execute: jest.fn(),
+    });
+    expect(decision).toMatchObject({ status: 'refused', unavailable: true });
+    expect((decision as any).message).toMatch(/approval queue unavailable/);
+    error.mockRestore();
   });
 });

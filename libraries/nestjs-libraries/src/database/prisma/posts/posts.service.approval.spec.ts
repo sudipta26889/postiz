@@ -121,7 +121,7 @@ describe('approval duplicate decision (PostsService, G4 v3)', () => {
       [item(), item({ integrationId: 'chan-2' })],
       'execute'
     );
-    expect(verdict.refuse).toMatch(/channels not posted: chan-2 \(resend those alone\)/);
+    expect(verdict.refuse).toMatch(/not posted either: channel chan-2 \(resend those alone\)/);
   });
 
   it('looks only at this org and these channels, excluding the draft itself', async () => {
@@ -140,5 +140,35 @@ describe('approval duplicate decision (PostsService, G4 v3)', () => {
     const a = item();
     const b = item({ integrationId: 'chan-2' });
     expect(service.approvalFingerprint([a, b])).toBe(service.approvalFingerprint([b, a]));
+  });
+
+  it('names each post that was not posted, by its label, even on one channel', async () => {
+    const { service } = serviceWith([stored()]);
+    const verdict = await service.approvalDuplicateCheck(
+      'org1',
+      [
+        item({ label: 'chan-1 Monday' }),
+        item({ label: 'chan-1 Tuesday', content: '<p>Another day</p>' }),
+      ],
+      'execute'
+    );
+    expect(verdict.refuse).toMatch(/not posted either: chan-1 Tuesday/);
+    expect(verdict.refuse).not.toMatch(/chan-1 Monday \(resend/);
+  });
+
+  it('does not count a post as a copy of itself when it is being edited', async () => {
+    const { service, getRecentChannelPosts } = serviceWith([]);
+    await service.approvalDuplicateCheck('org1', [item()], 'request', [], ['p-old']);
+    expect(getRecentChannelPosts).toHaveBeenCalledWith('org1', ['chan-1'], expect.any(Date), ['p-old']);
+  });
+
+  it('schedules only a draft: a queued or published post gives no items to approve', async () => {
+    const { service } = serviceWith([]);
+    for (const state of ['QUEUE', 'PUBLISHED', 'ERROR']) {
+      (service as any).getPostsRecursively = jest.fn(async () => [stored({ state })]);
+      expect(await service.approvalItemsOfPost('org1', 'p-old')).toEqual([]);
+    }
+    (service as any).getPostsRecursively = jest.fn(async () => [stored({ state: 'DRAFT' })]);
+    expect(await service.approvalItemsOfPost('org1', 'p-old')).toHaveLength(1);
   });
 });

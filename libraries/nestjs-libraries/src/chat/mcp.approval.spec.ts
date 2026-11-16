@@ -10,9 +10,9 @@ const fakeRedis = () => {
   const data = new Map<string, string>();
   return {
     data,
-    get: async (k: string) => data.get(k) ?? null,
+    get: async (k: string) => (k.endsWith(':index') ? ((globalThis as any).__sets ?? {})[k] ?? null : data.get(k) ?? null),
     // the lock release script: delete only if the token still matches
-    eval: async (_script: string, _n: number, k: string, token: string) => (data.get(k) === token ? (data.delete(k), 1) : 0),
+    eval: async (script: string, _n: number, k: string, arg: string) => { const g = ((globalThis as any).__sets ??= {}); if (script.includes('table.insert(t, ARGV[1])')) { const list: string[] = JSON.parse(g[k] ?? '[]'); if (list.includes(arg)) return 0; list.push(arg); g[k] = JSON.stringify(list); return 1; } if (script.includes('x ~= ARGV[1]')) { const list: string[] = JSON.parse(g[k] ?? '[]'); g[k] = JSON.stringify(list.filter((x) => x !== arg)); return 1; } return data.get(k) === arg ? (data.delete(k), 1) : 0; },
     set: async (k: string, v: string, ...opts: any[]) => {
       if (opts.includes('NX') && data.has(k)) return null;
       data.set(k, v);

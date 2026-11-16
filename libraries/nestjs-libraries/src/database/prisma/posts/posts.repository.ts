@@ -1287,7 +1287,7 @@ export class PostsRepository {
     orgId: string,
     integrationIds: string[],
     since: Date,
-    excludePostId?: string
+    excludePostIds: string[] = []
   ) {
     return this._post.model.post.findMany({
       where: {
@@ -1295,7 +1295,7 @@ export class PostsRepository {
         integrationId: { in: integrationIds },
         deletedAt: null,
         parentPostId: null,
-        ...(excludePostId ? { id: { not: excludePostId } } : {}),
+        ...(excludePostIds.length ? { id: { notIn: excludePostIds } } : {}),
         OR: [
           { state: 'QUEUE' },
           { state: { in: ['PUBLISHED', 'ERROR'] }, publishDate: { gte: since } },

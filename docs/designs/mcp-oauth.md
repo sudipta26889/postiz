@@ -318,6 +318,31 @@ The same read and compare, with no locks:
 - DharaHIL has no cancel endpoint. A request joined after a race stays in the owner's queue, and rule 3 stops it from
   posting twice.
 
+## Phase G5: every outcome is reported, and the queue can't fail silently (2026-11-17)
+
+- **Expiry.** A request nobody decided in time (EXPIRED, AUTO_DENIED) is reported to the organization once, in-app
+  and by e-mail through `NotificationService` (`approvalGate.registerNotifier`). The agent's next identical call
+  answers "not approved (EXPIRED); nothing was carried out", and the call after that files a new request. A rejection
+  by the owner isn't notified, because the owner made it.
+- **Approved but not carried out** (duplicate at execution, a no-op, a failure): DharaHIL gets
+  `/executed` `executed=false` with the reason, and the organization is notified once (`hil:notified:<id>`).
+- **Crash order.** A request already claimed (`hil:exec:<id>`) is answered from its own state (done, or outcome
+  unknown) before any duplicate check, so it never calls its own posts duplicates.
+- **Status route.** Only queued ↔ draft. A published or failed post can't become a draft, and only a draft can be
+  scheduled (400, nothing filed), so a post that went out can't be re-queued.
+- **Edits.** Posts being edited are excluded from the duplicate check. "Not posted" is listed per post (label).
+- **Pending look-alikes.** A different request still waiting for the same channel puts "⚠ Possible duplicate of
+  pending request R" first.
+- **Redis.**
+  - The waiting list is one JSON key, changed only inside EVAL scripts with GET/SET. Postiz's rate limiter already
+    runs those in production on every request, so they're allowed. No set commands are used.
+  - Lock release falls back to compare-then-delete if EVAL is ever refused.
+  - At start, `selfTest()` tries every operation the gate needs. If one fails, it logs the reason, and the gate
+    refuses gated actions with 503 and that reason.
+- **Agent wording.** "To learn the outcome later, call again with the same arguments: it reports done, still waiting,
+  expired or not carried out."
+- **Expiry length** is set by the DharaHIL policy, not per request. Postiz asks for 24 h (86400 s).
+
 ## Phase H1: hardening with no schema change (revised)
 
 | Gap | Change |

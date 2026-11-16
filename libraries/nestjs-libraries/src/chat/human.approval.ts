@@ -93,6 +93,9 @@ export interface ApprovalGuard {
     phase: 'request' | 'execute',
     shown: string[]
   ) => Promise<{ refuse?: string; warn?: string; shown?: string[] }>;
+  // where it lands (channel ids), to warn about a different request still
+  // waiting for the same channel
+  channels?: (args: any) => string[];
 }
 
 // How Postiz carries out an approved action on its own (no agent retry):
@@ -189,7 +192,6 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
   const reqKey = (key: string) => `hil:req:${key}`;
   // a pending approval Postiz will carry out itself once a person approves
   const pendingKey = (requestId: string) => `hil:pending:${requestId}`;
-  const pendingSet = 'hil:pending';
   const executors = new Map<string, ApprovalExecutor>();
   const joinKey = (org: string, fingerprint: string) =>
     `hil:join:${org}:${crypto.createHash('sha256').update(fingerprint).digest('hex').slice(0, 32)}`;
@@ -200,6 +202,101 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
   const releaseScript =
     "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
 
+  // The list of waiting requests is one JSON array in one key, changed only
+  // inside a script with GET/SET: the commands Postiz's own rate limiter
+  // already runs in production (no set commands the Redis ACL may refuse),
+  // and atomic, so two writers can't lose an entry
+  const indexKey = 'hil:pending:index';
+  const indexAddScript = [
+    "local v = redis.call('GET', KEYS[1])",
+    "local t = {}",
+    "if v then local ok, d = pcall(cjson.decode, v) if ok and type(d) == 'table' then t = d end end",
+    "for _, x in ipairs(t) do if x == ARGV[1] then return 0 end end",
+    "table.insert(t, ARGV[1])",
+    "redis.call('SET', KEYS[1], cjson.encode(t))",
+    "return 1",
+  ].join('\n');
+  const indexRemoveScript = [
+    "local v = redis.call('GET', KEYS[1])",
+    "if not v then return 0 end",
+    "local ok, d = pcall(cjson.decode, v)",
+    "if not ok or type(d) ~= 'table' then return 0 end",
+    "local t = {}",
+    "for _, x in ipairs(d) do if x ~= ARGV[1] then table.insert(t, x) end end",
+    "redis.call('SET', KEYS[1], cjson.encode(t))",
+    "return 1",
+  ].join('\n');
+  const indexAdd = (requestId: string) =>
+    deps.redis.eval(indexAddScript, 1, indexKey, requestId);
+  const indexRemove = (requestId: string) =>
+    deps.redis.eval(indexRemoveScript, 1, indexKey, requestId);
+  const indexMembers = async (): Promise<string[]> => {
+    const raw = await deps.redis.get(indexKey);
+    try {
+      const list = raw ? JSON.parse(raw) : [];
+      // an empty Lua table encodes as {}
+      return Array.isArray(list) ? list : [];
+    } catch {
+      return [];
+    }
+  };
+
+  // Every Redis operation the gate relies on, tried once at start. If one is
+  // refused (an ACL, a misconfigured server), the gate says so and refuses
+  // gated actions with 503 instead of failing silently later
+  let broken: string | undefined;
+  const selfTest = async () => {
+    const probe = `hil:probe:${crypto.randomBytes(6).toString('hex')}`;
+    const token = crypto.randomBytes(8).toString('hex');
+    try {
+      if (!(await deps.redis.set(probe, token, 'PX', 60000, 'NX'))) {
+        throw new Error('SET NX PX did not take a fresh key');
+      }
+      if ((await deps.redis.get(probe)) !== token) {
+        throw new Error('GET did not return what SET stored');
+      }
+      await deps.redis.expire(probe, 60);
+      if ((await deps.redis.eval(releaseScript, 1, probe, token)) !== 1) {
+        throw new Error('EVAL compare-and-delete did not delete');
+      }
+      const list = `${probe}:index`;
+      await deps.redis.eval(indexAddScript, 1, list, 'a');
+      await deps.redis.eval(indexRemoveScript, 1, list, 'a');
+      await deps.redis.del(list);
+      broken = undefined;
+    } catch (err: any) {
+      broken = `approval queue unavailable: a Redis operation it needs failed (${err?.message || err}); gated actions are refused until this is fixed`;
+      console.error(`[approval] ${broken}`);
+    }
+    return broken;
+  };
+
+  // Tells the organization's people (in-app and e-mail) what an approval
+  // came to when nobody is there to hear it: an expiry, or an approved action
+  // that was not carried out. Registered by the backend (NotificationService)
+  let notifier:
+    | ((org: string, subject: string, message: string) => Promise<unknown>)
+    | undefined;
+  const notifyOnce = async (
+    requestId: string,
+    org: string,
+    subject: string,
+    message: string
+  ) => {
+    if (!notifier) {
+      return;
+    }
+    try {
+      if (
+        await deps.redis.set(`hil:notified:${requestId}`, '1', 'EX', approvedTtl, 'NX')
+      ) {
+        await notifier(org, subject, message);
+      }
+    } catch (err: any) {
+      console.error(`[approval] could not notify about ${requestId}`, err?.message);
+    }
+  };
+
   // The stored pending entry: the args the person saw and what they were
   // shown as resemblances
   const pendingItem = async (requestId: string) => {
@@ -208,7 +305,14 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       return null;
     }
     try {
-      return JSON.parse(raw) as { args: any; shown?: string[] };
+      return JSON.parse(raw) as {
+        args: any;
+        shown?: string[];
+        reason?: string;
+        org?: string;
+        channels?: string[];
+        fingerprint?: string | null;
+      };
     } catch {
       return null;
     }
@@ -249,7 +353,19 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     const taken: string[] = [];
     const release = async () => {
       for (const name of taken) {
-        await deps.redis.eval(releaseScript, 1, lockKey(name), token);
+        try {
+          await deps.redis.eval(releaseScript, 1, lockKey(name), token);
+        } catch {
+          // no EVAL allowed: compare then delete (a tiny race, the lock
+          // expires anyway); never let a release failure surface
+          try {
+            if ((await deps.redis.get(lockKey(name))) === token) {
+              await deps.redis.del(lockKey(name));
+            }
+          } catch (err: any) {
+            console.error(`[approval] could not release ${name}`, err?.message);
+          }
+        }
       }
     };
     for (const name of names) {
@@ -264,9 +380,15 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     }
 
     try {
+      // already claimed by this very request (done, or started and cut off):
+      // its own state answers, never the duplicate check, which would find
+      // this request's own posts
+      if (await deps.redis.get(execKey(requestId))) {
+        return await claimAndRunUnguarded(cfg, requestId, version, args, input);
+      }
       const verdict = await input.guard.check(args, input.org, 'execute', shown);
       if (verdict.refuse) {
-        await reportNotExecuted(cfg, requestId, version, verdict.refuse);
+        await notApproved(cfg, requestId, version, input.org, verdict.refuse);
         await forgetPending(requestId);
         return { status: 'refused', duplicate: true, message: verdict.refuse };
       }
@@ -293,8 +415,27 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     }
   };
 
+  // An approved action that was not carried out: DharaHIL records it, and
+  // the organization is told once, with the reason
+  const notApproved = async (
+    cfg: ApprovalConfig,
+    requestId: string,
+    version: number,
+    org: string,
+    reason: string
+  ) => {
+    await reportNotExecuted(cfg, requestId, version, reason);
+    const stored = await pendingItem(requestId);
+    await notifyOnce(
+      requestId,
+      org,
+      'An approved agent action was not carried out',
+      `Request ${requestId}${stored?.reason ? ` (${stored.reason.slice(0, 300)})` : ''} was approved but not carried out: ${reason}`
+    );
+  };
+
   const forgetPending = async (requestId: string) => {
-    await deps.redis.srem(pendingSet, requestId);
+    await indexRemove(requestId);
     await deps.redis.del(pendingKey(requestId));
   };
 
@@ -330,17 +471,37 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     let result: T;
     try {
       result = await input.execute(args);
-    } catch (err) {
+    } catch (err: any) {
       // an error before any side effect releases the claim; any other leaves
-      // it as 'running', because the outcome is unknown
-      if (input.releaseOnError?.(err)) {
+      // it as 'running', because the outcome is unknown. Either way it is
+      // reported, so nothing fails silently
+      const nothingDone = !!input.releaseOnError?.(err);
+      if (nothingDone) {
         await deps.redis.del(execKey(requestId));
       }
+      await notApproved(
+        cfg,
+        requestId,
+        version,
+        input.org,
+        nothingDone
+          ? `it failed and nothing was done (${err?.message || err})`
+          : `it failed part-way (${err?.message || err}); the outcome is unknown, check before retrying`
+      );
       throw err;
     }
 
     if (input.isNoop?.(result)) {
       await deps.redis.del(execKey(requestId));
+      await notApproved(
+        cfg,
+        requestId,
+        version,
+        input.org,
+        `nothing was done: ${String(
+          (result as any)?.output?.errors ?? 'the action refused the arguments'
+        ).slice(0, 300)}`
+      );
       return { status: 'executed', result };
     }
 
@@ -368,7 +529,8 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     cfg: ApprovalConfig,
     key: string,
     requestId: string,
-    input: DecideInput<T>
+    input: DecideInput<T>,
+    origin: 'caller' | 'sweep' = 'caller'
   ): Promise<ApprovalDecision<T>> => {
     const data = await call(cfg, 'GET', `/v1/requests/${requestId}`);
 
@@ -388,13 +550,29 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     }
 
     if (data.status !== 'APPROVED') {
-      await deps.redis.del(reqKey(key));
-      return {
-        status: 'refused',
-        message: `Not approved (${data.status}${
-          data.last_decision_note ? `: ${data.last_decision_note}` : ''
-        }). Asking again starts a new request.`,
-      };
+      const outcome = `Request ${requestId} was not approved (${data.status}${
+        data.last_decision_note ? `: ${data.last_decision_note}` : ''
+      }); nothing was carried out.`;
+      // nobody decided in time: say so to the organization, once
+      if (data.status !== 'REJECTED') {
+        const stored = await pendingItem(requestId);
+        await notifyOnce(
+          requestId,
+          input.org,
+          'An agent request expired without approval',
+          `${outcome}${stored?.reason ? ` It was: ${stored.reason.slice(0, 300)}` : ''}`
+        );
+      }
+      // the sweep keeps the mapping so the agent's next identical call learns
+      // this outcome; that call then frees it, and the one after asks anew
+      if (origin === 'caller') {
+        await deps.redis.del(reqKey(key));
+        return {
+          status: 'refused',
+          message: `${outcome} Calling again with the same arguments files a new request.`,
+        };
+      }
+      return { status: 'refused', message: outcome };
     }
 
     // a human must have made the decision (not a rule or a standing grant)
@@ -483,6 +661,28 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
         reason = `${verdict.warn}\n\n${reason}`;
         shown = verdict.shown || [];
       }
+
+      // a different request still waiting for the same channel: the approver
+      // should see both side by side
+      const channels = input.guard.channels?.(input.args) || [];
+      if (channels.length) {
+        const others: string[] = [];
+        for (const id of await indexMembers()) {
+          const other = await pendingItem(id);
+          if (
+            other?.org === input.org &&
+            other.fingerprint !== fingerprint &&
+            (other.channels || []).some((c) => channels.includes(c))
+          ) {
+            others.push(id);
+          }
+        }
+        if (others.length) {
+          reason = `⚠ Possible duplicate of pending request${
+            others.length > 1 ? 's' : ''
+          } ${others.join(', ')} (same channel). Approve only if this is a different post.\n\n${reason}`;
+        }
+      }
     }
 
     const created = await call(cfg, 'POST', '/v1/requests', {
@@ -519,11 +719,12 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       };
     }
 
+    // kept past expiry, so a later identical call learns how it ended
     await deps.redis.set(
       reqKey(key),
       created.request_id,
       'EX',
-      ttlUntil(created.expires_at)
+      ttlUntil(created.expires_at) + approvedTtl
     );
     if (created.status === 'PENDING') {
       // remembered so Postiz runs it itself the moment a person approves
@@ -535,11 +736,14 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
           args: input.args,
           key,
           shown,
+          reason,
+          channels: input.guard?.channels?.(input.args) || [],
+          fingerprint,
         }),
         'EX',
         ttlUntil(created.expires_at) + approvedTtl
       );
-      await deps.redis.sadd(pendingSet, created.request_id);
+      await indexAdd(created.request_id);
       if (fingerprint) {
         await deps.redis.set(
           joinKey(input.org, fingerprint),
@@ -550,7 +754,7 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       }
       return pending(
         created.request_id,
-        `Approval requested in DharaHIL (request ${created.request_id}, expires ${created.expires_at}). Once a person approves, Postiz carries it out automatically: do not retry or change the request. Calling again with the same arguments only reports its status.`,
+        `Approval requested in DharaHIL (request ${created.request_id}, expires ${created.expires_at}). Once a person approves, Postiz carries it out automatically: do not re-file or change it. To learn the outcome later, call again with the same arguments: it reports done, still waiting, expired or not carried out (with the reason), and never files a second request.`,
         created.expires_at
       );
     }
@@ -576,6 +780,9 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
         message:
           'Approval needs Redis (REDIS_URL is not set), this action is refused',
       };
+    }
+    if (broken) {
+      return { status: 'refused', unavailable: true, message: broken };
     }
 
     try {
@@ -607,24 +814,26 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       !cfg.tenantId ||
       !cfg.appId ||
       !cfg.apiKey ||
-      !deps.hasRedis()
+      !deps.hasRedis() ||
+      broken
     ) {
       return;
     }
 
     const forget = async (requestId: string) => {
-      await deps.redis.srem(pendingSet, requestId);
+      await indexRemove(requestId);
       await deps.redis.del(pendingKey(requestId));
     };
 
-    for (const requestId of await deps.redis.smembers(pendingSet)) {
+    for (const requestId of await indexMembers()) {
       const raw = await deps.redis.get(pendingKey(requestId));
       if (!raw) {
-        await deps.redis.srem(pendingSet, requestId);
+        await indexRemove(requestId);
         continue;
       }
       // one unreadable entry must not stop every other approval
       let item: { action: string; org: string; args: any; key: string };
+      // (reason, channels and fingerprint are read through pendingItem)
       try {
         item = JSON.parse(raw);
       } catch {
@@ -647,7 +856,7 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
           isNoop: executor.isNoop,
           guard: executor.guard,
           execute: (args) => executor.execute(item.org, args),
-        });
+        }, 'sweep');
         if (decision.status !== 'pending') {
           await forget(requestId);
           if (decision.status === 'refused') {
@@ -665,13 +874,22 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
     }
   };
 
-  return { decide, registerExecutor, sweep };
+  const registerNotifier = (
+    fn: (org: string, subject: string, message: string) => Promise<unknown>
+  ) => {
+    notifier = fn;
+  };
+
+  return { decide, registerExecutor, registerNotifier, sweep, selfTest };
 };
 
 export const approvalGate = createApprovalGate();
 
 // Runs the sweep every 30 s in the backend; one sweep at a time
 export const startApprovalSweep = (gate = approvalGate, everyMs = 30000) => {
+  if (process.env.REDIS_URL) {
+    gate.selfTest().catch(() => undefined);
+  }
   let running = false;
   const timer = setInterval(async () => {
     if (running) {

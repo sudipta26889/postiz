@@ -89,6 +89,7 @@ export class IntegrationSchedulePostTool implements AgentToolInterface {
         integrationId: p.integrationId,
         content: p.postsAndComments?.[0]?.content || '',
         media: p.postsAndComments?.[0]?.attachments || [],
+        label: `channel ${p.integrationId} at ${p.date}`,
       }));
   }
 
@@ -104,6 +105,8 @@ export class IntegrationSchedulePostTool implements AgentToolInterface {
         phase,
         shown
       ),
+    channels: (args) =>
+      this.approvalItems(args).map((item) => item.integrationId),
   };
 
   // A human may have edited the approved args: every channel must still be

@@ -148,7 +148,17 @@ export class PublicIntegrationsController implements OnModuleInit {
       integrationId: p?.integration?.id,
       content: p?.value?.[0]?.content || '',
       media: p?.value?.[0]?.image || [],
+      label: `channel ${p?.integration?.id} at ${args?.date}`,
     }));
+  }
+
+  // posts this call edits (an update keeps their ids): they must not count
+  // as copies of themselves
+  private editedPostIds(args: any): string[] {
+    return (Array.isArray(args?.posts) ? args.posts : [])
+      .flatMap((p: any) => (Array.isArray(p?.value) ? p.value : []))
+      .map((v: any) => v?.id)
+      .filter((id: unknown): id is string => typeof id === 'string' && !!id);
   }
 
   private approvalGuards: Record<string, ApprovalGuard> = {
@@ -162,8 +172,11 @@ export class PublicIntegrationsController implements OnModuleInit {
           org,
           this.publishItems(args),
           phase,
-          shown
+          shown,
+          this.editedPostIds(args)
         ),
+      channels: (args) =>
+        this.publishItems(args).map((item) => item.integrationId),
     },
     // the draft already exists: it can't double itself, but its text may
     // already be queued or published on that channel by another post
@@ -180,12 +193,16 @@ export class PublicIntegrationsController implements OnModuleInit {
           await this._postsService.approvalItemsOfPost(org, args.id),
           phase,
           shown,
-          args.id
+          [args.id]
         ),
     },
   };
 
   onModuleInit() {
+    // what an approval came to, when no agent is there to hear it
+    approvalGate.registerNotifier((org, subject, message) =>
+      this._notificationService.inAppNotification(org, subject, message, true)
+    );
     for (const [action, run] of Object.entries(this.approvedActions)) {
       approvalGate.registerExecutor(action, {
         guard: this.approvalGuards[action],
@@ -856,12 +873,26 @@ export class PublicIntegrationsController implements OnModuleInit {
     @Body() body: ChangePostStatusDto
   ) {
     Sentry.metrics.count('public_api-request', 1);
-    // moving a draft to 'schedule' posts it: a human approves that (DharaHIL)
-    if (body?.status === 'draft') {
-      return this._postsService.changePostStatus(org.id, id, body.status);
-    }
     // the human sees what will go out, and the hash ties the approval to it
     const snapshot = await this._postsService.approvalSnapshot(org.id, id);
+    // Only queued <-> draft. A published or failed post never becomes a
+    // draft (that would let it be scheduled, and so posted, again)
+    if (body?.status === 'draft') {
+      if (snapshot.state !== 'QUEUE' && snapshot.state !== 'DRAFT') {
+        throw new HttpException(
+          { msg: `Only a scheduled post can be moved back to draft (this one is ${snapshot.state})` },
+          400
+        );
+      }
+      return this._postsService.changePostStatus(org.id, id, body.status);
+    }
+    // moving a draft to 'schedule' posts it: a human approves that (DharaHIL)
+    if (snapshot.state !== 'DRAFT') {
+      throw new HttpException(
+        { msg: `Only a draft can be scheduled here (this one is ${snapshot.state}); nothing was filed` },
+        400
+      );
+    }
     return publicApproval.run({
       action: 'public.posts.status',
       org: org.id,

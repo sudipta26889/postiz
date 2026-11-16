@@ -70,6 +70,8 @@ export interface ApprovalPostItem {
   integrationId: string;
   content: string;
   media: unknown;
+  // how to name it in a message (channel and date), when known
+  label?: string;
 }
 
 @Injectable()
@@ -587,7 +589,9 @@ export class PostsService {
     postId: string
   ): Promise<ApprovalPostItem[]> {
     const [root] = await this.getPostsRecursively(postId, false, orgId, true);
-    return root
+    // only a draft can be scheduled through approval: anything else would
+    // re-queue a post that is queued or already went out
+    return root && root.state === 'DRAFT'
       ? [
           {
             integrationId: root.integrationId,
@@ -627,7 +631,8 @@ export class PostsService {
     items: ApprovalPostItem[],
     phase: 'request' | 'execute',
     shown: string[] = [],
-    excludePostId?: string
+    // posts being edited (an update of a queued post must not match itself)
+    excludePostIds: string[] = []
   ): Promise<{ refuse?: string; warn?: string; shown?: string[] }> {
     if (!items.length) {
       return {};
@@ -637,7 +642,7 @@ export class PostsService {
       orgId,
       [...new Set(items.map((item) => item.integrationId))],
       since,
-      excludePostId
+      excludePostIds
     );
 
     const describe = (post: (typeof posts)[number]) =>
@@ -650,7 +655,8 @@ export class PostsService {
 
     const exact: typeof posts = [];
     const near: typeof posts = [];
-    for (const item of items) {
+    const duplicateItems = new Set<number>();
+    for (const [index, item] of items.entries()) {
       const mine = this.approvalFingerprints(item);
       for (const post of posts.filter(
         (p) => p.integrationId === item.integrationId
@@ -662,6 +668,7 @@ export class PostsService {
         });
         if (theirs.exact === mine.exact && post.state !== 'ERROR') {
           exact.push(post);
+          duplicateItems.add(index);
         } else if (theirs.loose === mine.loose) {
           near.push(post);
         }
@@ -669,14 +676,11 @@ export class PostsService {
     }
 
     if (exact.length) {
-      const channels = [...new Set(exact.map((p) => p.integrationId))];
-      const others = [
-        ...new Set(
-          items
-            .map((item) => item.integrationId)
-            .filter((id) => !channels.includes(id))
-        ),
-      ];
+      // per post, not per channel: one call may schedule many days on one
+      // channel, and only some of them may be copies
+      const others = items
+        .filter((_, index) => !duplicateItems.has(index))
+        .map((item) => item.label || `channel ${item.integrationId}`);
       return {
         refuse: `This exact post already exists: ${exact
           .map(describe)
@@ -684,7 +688,7 @@ export class PostsService {
           phase === 'request' ? 'filed' : 'posted'
         }${
           others.length
-            ? `; channels not posted: ${others.join(', ')} (resend those alone)`
+            ? `; not posted either: ${others.join(', ')} (resend those alone)`
             : ''
         }.`,
       };
