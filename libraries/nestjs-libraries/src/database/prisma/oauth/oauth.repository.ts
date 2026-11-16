@@ -543,7 +543,15 @@ export class OAuthRepository {
   // every live connection in an organization, with who made it (admins)
   getOrganizationConnections(organizationId: string) {
     return this._oauthAuth.model.oAuthAuthorization.findMany({
-      where: this.liveConnectionsWhere({ organizationId }),
+      // made by someone still an active member (removed members' grants
+      // already stop working, see isActiveMember)
+      where: this.liveConnectionsWhere({
+        organizationId,
+        user: {
+          deletedAt: null,
+          organizations: { some: { organizationId, disabled: false } },
+        },
+      }),
       select: this.connectionSelect(true),
       orderBy: { createdAt: 'desc' },
     });

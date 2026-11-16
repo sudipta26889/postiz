@@ -46,7 +46,11 @@ describe('connection lists never carry a credential', () => {
     await repo.getOrganizationConnections('o1');
     const query = (oAuthAuthorization.findMany.mock.calls[0] as any)[0];
     expect(secretsIn(query)).toBeNull();
-    expect(query.where).toMatchObject({ organizationId: 'o1', revokedAt: null });
+    expect(query.where).toMatchObject({
+      organizationId: 'o1',
+      revokedAt: null,
+      user: { deletedAt: null, organizations: { some: { organizationId: 'o1', disabled: false } } },
+    });
     expect(query.select.user).toEqual({ select: { name: true, email: true } });
   });
 });
