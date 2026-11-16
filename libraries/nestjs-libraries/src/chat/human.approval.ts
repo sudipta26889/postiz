@@ -800,6 +800,15 @@ export const createApprovalGate = (overrides: Partial<ApprovalDeps> = {}) => {
       await ready;
     }
     if (broken) {
+      // agents get the 503; the organization is told too (once a day), so a
+      // stopped approval queue is never noticed only in a server log
+      await notifyOnce(
+        `broken:${new Date().toISOString().slice(0, 10)}`,
+        input.org,
+        'Agent posting is paused: the approval queue is unavailable',
+        `${broken}. Agents' posts and deletes are refused until it is fixed.`,
+        'queue-unavailable'
+      );
       return { status: 'refused', unavailable: true, message: broken };
     }
 

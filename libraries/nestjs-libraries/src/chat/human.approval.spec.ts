@@ -629,4 +629,21 @@ describe('Redis self-test (no silent failure)', () => {
     expect((decision as any).message).toMatch(/approval queue unavailable/);
     error.mockRestore();
   });
+
+  it('tells the organization (once a day) that agent posting is paused while the queue is broken', async () => {
+    const gate = gateWith(() => async () => {
+      throw new Error('NOPERM eval');
+    });
+    const notify = jest.fn(async () => undefined);
+    gate.registerNotifier(notify);
+    const error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    await gate.selfTest();
+    const ask = () =>
+      gate.decide({ action: 'deletePostTool', org: 'org1', args: { id: 'p1' }, reason: 'x', execute: jest.fn() });
+    await ask();
+    await ask();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][1]).toMatch(/Agent posting is paused/);
+    error.mockRestore();
+  });
 });
