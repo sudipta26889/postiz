@@ -61,7 +61,7 @@ export class CopilotController {
       cors: copilotCors(),
       runtime: new CopilotRuntime(),
       serviceAdapter: new OpenAIAdapter({
-        model: 'gpt-4.1',
+        model: 'gpt-6.2-sol',
       }),
     });
 
@@ -107,7 +107,7 @@ export class CopilotController {
       cors: copilotCors(),
       runtime,
       serviceAdapter: new OpenAIAdapter({
-        model: 'gpt-4.1',
+        model: 'gpt-6.2-sol',
       }),
     });
 

@@ -103,6 +103,9 @@ export class NoAuthIntegrationsController {
       await ioRedis.del(`onboarding:${body.state}`);
     }
 
+    // the login that did a reconnect, the channel's root moves to it
+    let reconnectedBy: string | undefined;
+
     const {
       error,
       accessToken,
@@ -145,6 +148,7 @@ export class NoAuthIntegrationsController {
               refresh,
               auth.accessToken
             );
+            reconnectedBy = auth.id ? String(auth.id) : undefined;
             // keep the fresh refresh token and expiration from the new
             // authentication, otherwise the stored refresh token is wiped and
             // the channel breaks again as soon as the access token expires
@@ -221,6 +225,33 @@ export class NoAuthIntegrationsController {
       throw new HttpException('', 412);
     }
 
+    // Fetch pages if this is a two-step provider and not a refresh. Runs before
+    // the channel is saved, so a failed fetch never leaves a channel behind
+    let pages: any[] = [];
+    if (integrationProvider.isBetweenSteps && !refresh) {
+      try {
+        // Check which method the provider uses (pages or companies)
+        const fetchMethod =
+          'pages' in integrationProvider
+            ? 'pages'
+            : 'companies' in integrationProvider
+            ? 'companies'
+            : null;
+
+        if (fetchMethod) {
+          // @ts-ignore - dynamic method call
+          pages = await integrationProvider[fetchMethod](accessToken);
+        }
+      } catch (err) {
+        console.log('Failed to fetch pages:', err);
+        throw new NotEnoughScopes(
+          err instanceof NotEnoughScopes
+            ? err.message
+            : 'We could not load the pages or accounts of this channel right now, please try connecting it again in a few minutes'
+        );
+      }
+    }
+
     if (refresh && String(id) !== String(refresh)) {
       // A reconnect that returns a different id is either the wrong account or
       // a channel migrating to another provider (MIGRATE_PROVIDERS) - the two
@@ -272,7 +303,15 @@ export class NoAuthIntegrationsController {
           ? AuthService.fixedEncryption(
               Buffer.from(body.code, 'base64').toString()
             )
-          : undefined
+          : undefined,
+        // a oneTimeToken provider shares its tokens by root, so every connect
+        // states it: the login that reconnected, or the id it connected with
+        // (its login) when there was no page to reconnect
+        reconnectedBy ||
+          (integrationProvider.oneTimeToken &&
+          !(refresh && integrationProvider.reConnect)
+            ? String(id)
+            : undefined)
       );
 
     this._refreshIntegrationService
@@ -280,27 +319,6 @@ export class NoAuthIntegrationsController {
       .catch((err) => {
         console.log(err);
       });
-
-    // Fetch pages if this is a two-step provider and not a refresh
-    let pages: any[] = [];
-    if (integrationProvider.isBetweenSteps && !refresh) {
-      try {
-        // Check which method the provider uses (pages or companies)
-        const fetchMethod =
-          'pages' in integrationProvider
-            ? 'pages'
-            : 'companies' in integrationProvider
-            ? 'companies'
-            : null;
-
-        if (fetchMethod) {
-          // @ts-ignore - dynamic method call
-          pages = await integrationProvider[fetchMethod](accessToken);
-        }
-      } catch (err) {
-        console.log('Failed to fetch pages:', err);
-      }
-    }
 
     const webhookUrl = await ioRedis.get(`webhookUrl:${body.state}`);
     if (webhookUrl) {

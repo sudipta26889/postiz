@@ -12,6 +12,7 @@ import { AuthService } from '@gitroom/helpers/auth/auth.service';
 import { TrackService } from '@gitroom/nestjs-libraries/track/track.service';
 import { UsersService } from '@gitroom/nestjs-libraries/database/prisma/users/users.service';
 import { TrackEnum } from '@gitroom/nestjs-libraries/user/track.enum';
+import { AttributionService } from '@gitroom/nestjs-libraries/services/attribution/attribution.service';
 import {
   PaymentInvoice,
   PaymentPlatform,
@@ -31,7 +32,8 @@ export class StripeService extends PaymentProviderAbstract {
     private _subscriptionService: SubscriptionService,
     private _organizationService: OrganizationService,
     private _userService: UsersService,
-    private _trackService: TrackService
+    private _trackService: TrackService,
+    private _attributionService: AttributionService
   ) {
     super();
   }
@@ -570,7 +572,7 @@ export class StripeService extends PaymentProviderAbstract {
     );
   }
 
-  async setToCancel(organizationId: string) {
+  async setToCancel(organizationId: string, cancel?: boolean) {
     const id = makeId(10);
     const org = await this._organizationService.getOrgById(organizationId);
     const customer = await this.createOrGetCustomer(org!);
@@ -584,6 +586,13 @@ export class StripeService extends PaymentProviderAbstract {
 
     // If the user is toggling back (un-cancelling), just remove the cancel
     if (sub.cancel_at_period_end) {
+      if (cancel) {
+        return {
+          id,
+          cancel_at: sub.cancel_at ? new Date(sub.cancel_at * 1000) : undefined,
+          unchanged: true,
+        };
+      }
       let cancel_at: number | null = null;
       for (const s of subscriptions) {
         const updated = await stripe.subscriptions.update(s.id, {
@@ -598,6 +607,10 @@ export class StripeService extends PaymentProviderAbstract {
         id,
         cancel_at: cancel_at ? new Date(cancel_at * 1000) : undefined,
       };
+    }
+
+    if (cancel === false) {
+      return { id, cancel_at: undefined, unchanged: true };
     }
 
     // Check if the latest invoice has a failed payment
@@ -1271,8 +1284,8 @@ export class StripeService extends PaymentProviderAbstract {
   }
 
   async paymentSucceeded(event: Stripe.InvoicePaymentSucceededEvent) {
-    // only feeds the Facebook pixel, it runs in the background so it can
-    // never fail or slow down the webhook
+    // only feeds the Facebook pixel and the attribution tools, it runs in the
+    // background so it can never fail or slow down the webhook
     this.trackConversion(event.data.object).catch((err) => {});
     // the first payment of a new subscription makes the unpaid invoices of
     // the cancelled ones obsolete
@@ -1587,15 +1600,19 @@ export class StripeService extends PaymentProviderAbstract {
         return;
       }
 
+      const purchase = {
+        value: invoice.amount_paid / 100,
+        currency: invoice.currency,
+      };
+
       await this.trackSubscription(
         subscription.metadata,
         invoice.id,
         TrackEnum.Purchase,
-        {
-          value: invoice.amount_paid / 100,
-          currency: invoice.currency,
-        }
+        purchase
       );
+
+      await this.attributePurchase(subscription.metadata, invoice.id, purchase);
     } catch (err) {
       console.error(
         'stripe_pixel_conversion_failed',
@@ -1638,6 +1655,35 @@ export class StripeService extends PaymentProviderAbstract {
       console.error(
         'stripe_pixel_event_failed',
         { stripe_object_id: eventId, event: TrackEnum[tt] },
+        err
+      );
+    }
+  }
+
+  // Attribution tools (LeadJourney, ...) got the user who checked out the
+  // subscription as a lead when the account was created.
+  // Never throws, tracking must not affect billing.
+  private async attributePurchase(
+    metadata: Stripe.Metadata,
+    invoiceId: string,
+    purchase: { value: number; currency: string }
+  ) {
+    try {
+      const { userId } = metadata || {};
+      if (!userId) {
+        return;
+      }
+
+      const user = await this._userService.getUserById(userId);
+      if (!user) {
+        return;
+      }
+
+      await this._attributionService.purchase(user, purchase);
+    } catch (err) {
+      console.error(
+        'stripe_attribution_purchase_failed',
+        { stripe_object_id: invoiceId },
         err
       );
     }
@@ -1958,6 +2004,7 @@ export class StripeService extends PaymentProviderAbstract {
       await stripe.subscriptions.list({
         customer,
         status: 'all',
+        limit: 100,
       })
     ).data.filter((f) => f.status !== 'canceled');
 
@@ -1989,13 +2036,36 @@ export class StripeService extends PaymentProviderAbstract {
       undefined;
 
     for (const charge of charges) {
-      const invoiceId = (charge as any).invoice;
-      if (!invoiceId || typeof invoiceId !== 'string') {
+      const paymentIntentId =
+        typeof charge.payment_intent === 'string'
+          ? charge.payment_intent
+          : charge.payment_intent?.id;
+      if (!paymentIntentId) {
         continue;
       }
 
       try {
-        const invoice = await stripe.invoices.retrieve(invoiceId);
+        const invoicePayments = await stripe.invoicePayments.list({
+          payment: { type: 'payment_intent', payment_intent: paymentIntentId },
+          status: 'paid',
+          limit: 2,
+        });
+        if (invoicePayments.data.length !== 1) {
+          continue;
+        }
+
+        const paidInvoice = invoicePayments.data[0].invoice;
+        const invoice = await stripe.invoices.retrieve(
+          typeof paidInvoice === 'string' ? paidInvoice : paidInvoice.id
+        );
+        const invoiceCustomer =
+          typeof invoice.customer === 'string'
+            ? invoice.customer
+            : invoice.customer?.id;
+        if (invoiceCustomer !== customer) {
+          continue;
+        }
+
         const invoiceSubscription =
           invoice.parent?.subscription_details?.subscription;
         const subscriptionId =
@@ -2065,14 +2135,17 @@ export class StripeService extends PaymentProviderAbstract {
 
     const org = await this._organizationService.getOrgById(organizationId);
 
-    await stripe.refunds.create({
-      charge: preview.chargeId,
-      amount: Math.round(preview.amount * 100),
-      metadata: {
-        reason: 'chatbase_refund',
-        organizationId,
+    await stripe.refunds.create(
+      {
+        charge: preview.chargeId,
+        amount: Math.round(preview.amount * 100),
+        metadata: {
+          reason: 'chatbase_refund',
+          organizationId,
+        },
       },
-    });
+      { idempotencyKey: `chatbase_refund_${preview.chargeId}` }
+    );
 
     for (const subscriptionId of preview.subscriptionIds) {
       await stripe.subscriptions.cancel(subscriptionId);

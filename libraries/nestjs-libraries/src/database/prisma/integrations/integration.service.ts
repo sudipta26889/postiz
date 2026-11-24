@@ -118,7 +118,9 @@ export class IntegrationService {
     isBetweenSteps = false,
     refresh?: string,
     timezone?: number,
-    customInstanceDetails?: string
+    customInstanceDetails?: string,
+    rootInternalId?: string,
+    expectedRootInternalId?: string | null
   ) {
     const uploadedPicture = picture
       ? picture?.indexOf('imagedelivery.net') > -1
@@ -145,7 +147,9 @@ export class IntegrationService {
       isBetweenSteps,
       refresh,
       timezone,
-      customInstanceDetails
+      customInstanceDetails,
+      rootInternalId,
+      expectedRootInternalId
     );
   }
 
@@ -163,6 +167,25 @@ export class IntegrationService {
 
   getChannelHealth(org: string, includeDeleted = false) {
     return this._integrationRepository.getChannelHealth(org, includeDeleted);
+  }
+
+  // Only for providers that cannot post without a selected page: the channel
+  // is still in between steps, or its internalId still equals the account id
+  // because a token refresh flipped inBetweenSteps off
+  needsPageSelection(
+    integration: Pick<
+      Integration,
+      'inBetweenSteps' | 'internalId' | 'rootInternalId'
+    >,
+    provider: SocialProvider
+  ) {
+    return (
+      !!provider?.pageRequiredToPost &&
+      (integration.inBetweenSteps ||
+        (!!integration.rootInternalId &&
+          integration.internalId === integration.rootInternalId &&
+          !provider.isPageId?.(integration.internalId)))
+    );
   }
 
   getIntegrationForOrder(id: string, order: string, user: string, org: string) {
@@ -370,7 +393,10 @@ export class IntegrationService {
 
       await this.createOrUpdateIntegration(
         undefined,
-        !!provider.oneTimeToken,
+        // a root that is a page id (older channels) names no login: other
+        // organizations' channels of that page can belong to other logins
+        !!provider.oneTimeToken &&
+          !provider.isPageId?.(integration.rootInternalId || ''),
         integration.organizationId,
         integration.name,
         undefined,
@@ -379,7 +405,15 @@ export class IntegrationService {
         integration.providerIdentifier,
         accessToken,
         refreshToken,
-        expiresIn
+        expiresIn,
+        undefined,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        // stored only if no reconnect moved the channel meanwhile
+        integration.rootInternalId
       );
     }
   }
@@ -430,13 +464,16 @@ export class IntegrationService {
     if (!getIntegration) {
       throw new HttpException('Integration not found', HttpStatus.NOT_FOUND);
     }
-    if (!getIntegration.inBetweenSteps) {
-      throw new HttpException('Invalid request', HttpStatus.BAD_REQUEST);
-    }
-
     const provider = this._integrationManager.getSocialIntegration(
       getIntegration.providerIdentifier
     );
+
+    if (
+      !getIntegration.inBetweenSteps &&
+      !this.needsPageSelection(getIntegration, provider)
+    ) {
+      throw new HttpException('Invalid request', HttpStatus.BAD_REQUEST);
+    }
 
     if (!provider.fetchPageInformation) {
       throw new HttpException(
@@ -454,15 +491,23 @@ export class IntegrationService {
       org,
       String(getIntegrationInformation.id)
     );
-    await this._integrationRepository.updateIntegration(id, {
-      picture: getIntegrationInformation.picture,
-      internalId: String(getIntegrationInformation.id),
-      organizationId: org,
-      name: getIntegrationInformation.name,
-      inBetweenSteps: false,
-      token: getIntegrationInformation.access_token,
-      profile: getIntegrationInformation.username,
-    });
+    const saved = await this._integrationRepository.updateIntegration(
+      id,
+      {
+        picture: getIntegrationInformation.picture,
+        internalId: String(getIntegrationInformation.id),
+        organizationId: org,
+        name: getIntegrationInformation.name,
+        inBetweenSteps: false,
+        token: getIntegrationInformation.access_token,
+        profile: getIntegrationInformation.username,
+      },
+      getIntegration
+    );
+
+    if (!saved) {
+      throw new HttpException('Invalid request', HttpStatus.BAD_REQUEST);
+    }
 
     return { success: true };
   }
@@ -615,8 +660,14 @@ export class IntegrationService {
       getIntegration.providerIdentifier
     );
 
+    // A deleted channel is neither refreshed nor called
+    if (getIntegration.deletedAt) {
+      return [];
+    }
+
     if (
-      dayjs(getIntegration?.tokenExpiration).isBefore(dayjs()) ||
+      (dayjs(getIntegration?.tokenExpiration).isBefore(dayjs()) &&
+        !integrationProvider.noRefreshBeforeCall) ||
       forceRefresh
     ) {
       const data = await this._refreshIntegrationService.refresh(

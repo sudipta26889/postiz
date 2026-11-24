@@ -32,6 +32,7 @@ import { MediaService } from '@gitroom/nestjs-libraries/database/prisma/media/me
 import { GetPostsDto } from '@gitroom/nestjs-libraries/dtos/posts/get.posts.dto';
 import { ChangePostStatusDto } from '@gitroom/nestjs-libraries/dtos/posts/change.post.status.dto';
 import { UpdatePostSettingsDto } from '@gitroom/nestjs-libraries/dtos/posts/update.post.settings.dto';
+import { UpdatePostAttachmentsDto } from '@gitroom/nestjs-libraries/dtos/posts/update.post.attachments.dto';
 import {
   AuthorizationActions,
   Sections,
@@ -973,6 +974,21 @@ export class PublicIntegrationsController implements OnModuleInit {
         409
       );
     }
+  }
+
+  @Put('/posts/:id/attachments')
+  async updatePostAttachments(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Body() body: UpdatePostAttachmentsDto
+  ) {
+    Sentry.metrics.count('public_api-request', 1);
+    return this._postsService.updatePostAttachments(
+      org.id,
+      id,
+      body.attachments,
+      'API'
+    );
   }
 
   @Put('/posts/:id/status')

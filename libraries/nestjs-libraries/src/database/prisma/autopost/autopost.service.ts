@@ -6,7 +6,7 @@ import { END, START, StateGraph } from '@langchain/langgraph';
 import { AutoPost, Integration } from '@prisma/client';
 import { BaseMessage } from '@langchain/core/messages';
 import striptags from 'striptags';
-import { ChatOpenAI, DallEAPIWrapper } from '@langchain/openai';
+import { ChatOpenAI } from '@langchain/openai';
 import { JSDOM } from 'jsdom';
 import { z } from 'zod';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
@@ -19,6 +19,9 @@ import { TypedSearchAttributes } from '@temporalio/common';
 import {
   organizationId,
 } from '@gitroom/nestjs-libraries/temporal/temporal.search.attribute';
+import { OpenaiService } from '@gitroom/nestjs-libraries/openai/openai.service';
+import { UploadFactory } from '@gitroom/nestjs-libraries/upload/upload.factory';
+import { getSsrfSafeDispatcher } from '@gitroom/nestjs-libraries/dtos/webhooks/ssrf.safe.dispatcher';
 const parser = new Parser();
 
 interface WorkflowChannelsState {
@@ -37,13 +40,7 @@ interface WorkflowChannelsState {
 
 const model = new ChatOpenAI({
   apiKey: process.env.OPENAI_API_KEY || 'sk-proj-',
-  model: 'gpt-4.1',
-  temperature: 0.7,
-});
-
-const dalle = new DallEAPIWrapper({
-  apiKey: process.env.OPENAI_API_KEY || 'sk-proj-',
-  model: 'chatgpt-image-latest',
+  model: 'gpt-6.2-sol',
 });
 
 const generateContent = z.object({
@@ -60,11 +57,13 @@ const dallePrompt = z.object({
 
 @Injectable()
 export class AutopostService {
+  private storage = UploadFactory.createStorage();
   constructor(
     private _autopostsRepository: AutopostRepository,
     private _temporalService: TemporalService,
     private _integrationService: IntegrationService,
-    private _postsService: PostsService
+    private _postsService: PostsService,
+    private _openaiService: OpenaiService
   ) {}
 
   async stopAll(org: string) {
@@ -139,7 +138,36 @@ export class AutopostService {
 
   async loadXML(url: string) {
     try {
-      const { items } = await parser.parseURL(url);
+      // fetched through the SSRF guard (every redirect hop is checked), only
+      // the parsing is left to rss-parser
+      const response = await fetch(url, {
+        // @ts-ignore — undici option, not in lib.dom fetch types
+        dispatcher: getSsrfSafeDispatcher(),
+        signal: AbortSignal.timeout(60000),
+        // same headers rss-parser's parseURL sent, some feed hosts need them
+        headers: {
+          'User-Agent': 'rss-parser',
+          Accept: 'application/rss+xml',
+        },
+      });
+      if (!response.ok) {
+        throw new Error('Status code ' + response.status);
+      }
+
+      // response.text() is always utf-8, parseURL honoured the feed's charset
+      const charset = /charset\s*=\s*"?([^\s;"]+)/i.exec(
+        response.headers.get('content-type') || ''
+      )?.[1];
+      let decoder: TextDecoder;
+      try {
+        decoder = new TextDecoder(charset || 'utf-8');
+      } catch (err) {
+        decoder = new TextDecoder('utf-8');
+      }
+
+      const { items } = await parser.parseString(
+        decoder.decode(await response.arrayBuffer())
+      );
       const findLast = items.reduce(
         (all: any, current: any) => {
           if (dayjs(current.pubDate).isAfter(all.pubDate)) {
@@ -189,7 +217,11 @@ export class AutopostService {
 
   async loadUrl(url: string) {
     try {
-      const loadDom = new JSDOM(await (await fetch(url)).text());
+      const response = await fetch(url, {
+        // @ts-ignore — undici option, not in lib.dom fetch types
+        dispatcher: getSsrfSafeDispatcher(),
+      });
+      const loadDom = new JSDOM(await response.text());
       loadDom.window.document
         .querySelectorAll('script')
         .forEach((s) => s.remove());
@@ -262,7 +294,12 @@ export class AutopostService {
           content: state.load.description || state.description,
         });
 
-    const image = await dalle.invoke(generatedTextToBeSentToDallE);
+    const generatedImage = await this._openaiService.generateImage(
+      generatedTextToBeSentToDallE
+    );
+    const image = await this.storage.uploadSimple(
+      'data:image/png;base64,' + generatedImage
+    );
 
     return { ...state, image };
   }
